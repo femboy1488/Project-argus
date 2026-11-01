@@ -2,6 +2,7 @@ package com.harkcluster.node
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -14,6 +15,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.net.Uri
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -37,6 +39,12 @@ class MainActivity : Activity() {
     private lateinit var pill: TextView; private lateinit var title: TextView; private lateinit var hint: TextView
     private lateinit var toggle: Button; private lateinit var logView: TextView; private lateinit var logScroll: ScrollView
     private lateinit var checks: LinearLayout
+    private lateinit var wifiToggle: Button; private lateinit var wifiAddr: TextView; private lateinit var wifiInfo: TextView
+    private lateinit var wifiWarn: TextView; private lateinit var wifiBattery: Button
+    private lateinit var updVersion: TextView; private lateinit var updStatus: TextView; private lateinit var updButton: Button
+    private var updDialog: AlertDialog? = null
+    private var updAsked: String? = null      // "vn/vc" already asked in this screen session («Позже»)
+    private var updForceShow = false
     private val stat = HashMap<String, TextView>()
     private var lastLog = ""
 
@@ -75,14 +83,37 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL; background = box(PANEL); setPadding(dp(16), dp(16), dp(16), dp(16))
             title = label("", 26f, TEXT, mono = false).apply { setTypeface(Typeface.DEFAULT, Typeface.BOLD) }
             hint = label("", 13f, DIM, mono = false).apply { setPadding(0, dp(6), 0, dp(14)) }
-            toggle = btn("Start node", CYAN) { toggleNode() }
+            toggle = btn("Запустить узел", CYAN) { toggleNode() }
             addView(title); addView(hint); addView(toggle)
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
 
+        // Wi-Fi mode: rpc-server on 0.0.0.0:50052 + UDP beacon so Argus finds the node on the home LAN
+        root.addView(section("Wi-Fi режим"))
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = box(PANEL); setPadding(dp(16), dp(14), dp(16), dp(14))
+            wifiToggle = btn("Wi-Fi режим: выкл", CYAN) { toggleWifi() }
+            wifiAddr = label("—", 30f, TEXT).apply { setTypeface(Typeface.MONOSPACE, Typeface.BOLD); setPadding(0, dp(12), 0, dp(2)); setTextIsSelectable(true) }
+            wifiInfo = label("", 11f, DIM, mono = false)
+            wifiWarn = label("⚠ Только домашняя сеть: у RPC нет пароля", 12f, AMBER, mono = false).apply { setPadding(0, dp(8), 0, dp(8)) }
+            wifiBattery = btn("Отключить оптимизацию батареи", AMBER) { requestBatteryExemption() }
+            addView(wifiToggle); addView(wifiAddr); addView(wifiInfo); addView(wifiWarn); addView(wifiBattery)
+        })
+
+        // self-update (0.3.1): always asks — «Обновить» / «Позже» / «Пропустить эту версию»
+        root.addView(section("Обновление"))
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = box(PANEL); setPadding(dp(16), dp(14), dp(16), dp(14))
+            val (vn, vc) = Updater.myVersion(this@MainActivity)
+            updVersion = label("Установлена версия $vn ($vc)", 13f, TEXT, mono = false)
+            updStatus = label("", 11f, DIM, mono = false).apply { setPadding(0, dp(6), 0, dp(10)) }
+            updButton = btn("Проверить обновление", CYAN) { manualUpdateCheck() }
+            addView(updVersion); addView(updStatus); addView(updButton)
+        })
+
         // resources grid
-        root.addView(section("Resources"))
+        root.addView(section("Ресурсы"))
         val grid = GridLayout(this).apply { columnCount = if (resources.configuration.screenWidthDp > 600) 4 else 2 }
-        for (k in listOf("RAM FREE", "RAM TOTAL", "CPU CORES", "THREADS", "VARIANT", "CACHE", "PORT", "UPTIME", "PC LINKS", "RESTARTS")) {
+        for (k in listOf("ОЗУ СВОБОДНО", "ОЗУ ВСЕГО", "ЯДРА CPU", "ПОТОКИ", "ВАРИАНТ", "КЭШ", "ПОРТ", "АПТАЙМ", "ПОДКЛ. ПК", "РЕСТАРТЫ")) {
             val v = label("—", 18f, TEXT)
             stat[k] = v
             grid.addView(LinearLayout(this).apply {
@@ -97,30 +128,80 @@ class MainActivity : Activity() {
         // weight cache (rpc-server -c): tensors pushed once over USB are kept on the device
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(8), 0, 0)
-            addView(label("Weight cache keeps model layers on the device so the next load skips the USB copy.", 11f, DIM, mono = false),
+            addView(label("Кэш весов хранит слои модели на устройстве — при следующей загрузке их не нужно копировать заново.", 11f, DIM, mono = false),
                 LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("Clear cache", AMBER) { clearCache() })
+            addView(btn("Очистить кэш", AMBER) { clearCache() })
         })
 
         // health checks
-        root.addView(section("Checks"))
+        root.addView(section("Проверки"))
         checks = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(checks)
 
         // log
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            addView(section("Log"), LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("Copy", CYAN) { copyLog() })
+            addView(section("Журнал"), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("Копировать", CYAN) { copyLog() })
             addView(View(context), LinearLayout.LayoutParams(dp(8), 1))
-            addView(btn("Share", CYAN) { shareLog() })
+            addView(btn("Поделиться", CYAN) { shareLog() })
         })
         logView = label("", 11f, Color.parseColor("#B7C0CE")).apply { setTextIsSelectable(true); setPadding(dp(12), dp(10), dp(12), dp(10)) }
         logScroll = ScrollView(this).apply { background = box(Color.parseColor("#080A0F")); addView(logView) }
         root.addView(logScroll, LinearLayout.LayoutParams(-1, dp(260)).apply { topMargin = dp(6) })
 
         setContentView(ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(root) })
+        updForceShow = intent?.getBooleanExtra(Updater.EXTRA_SHOW, false) == true
         tick()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent); setIntent(intent)
+        if (intent.getBooleanExtra(Updater.EXTRA_SHOW, false)) { updForceShow = true; updAsked = null; maybeAskUpdate() }
+    }
+
+    private fun manualUpdateCheck() {
+        if (Updater.busy) return
+        updButton.isEnabled = false
+        thread(name = "update-check") {
+            val a = Updater.manualCheck(this)
+            ui.post {
+                updButton.isEnabled = true
+                if (a != null) { updForceShow = true; updAsked = null; maybeAskUpdate() }
+                else Toast.makeText(this, Updater.status.ifEmpty { "Обновлений нет" }, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /** The question. Nothing is downloaded or installed until the user taps «Обновить». */
+    private fun maybeAskUpdate() {
+        val a = Updater.available ?: return
+        val key = "${a.vn}/${a.vc}"
+        if (updDialog?.isShowing == true || updAsked == key || isFinishing) return
+        if (!updForceShow && !Updater.forced && Updater.skipped(this, a)) return
+        updAsked = key; updForceShow = false; Updater.forced = false
+        val (myVn, _) = Updater.myVersion(this)
+        val notes = a.notes.trim().let { if (it.isEmpty()) "" else "\n\n" + it.take(1200) }
+        updDialog = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Доступна версия ${a.vn}. Хотите обновить?")
+            .setMessage("Установлена: $myVn\nИсточник: ${a.source}" + (if (a.sha256 != null) "\nКонтрольная сумма SHA-256 будет проверена." else "") +
+                "\n\nAndroid попросит подтвердить установку. Узел перезапустится после обновления.$notes")
+            .setPositiveButton("Обновить") { _, _ -> startUpdate(a) }
+            .setNegativeButton("Позже") { _, _ -> }
+            .setNeutralButton("Пропустить эту версию") { _, _ -> Updater.skip(this, a) }
+            .show()
+    }
+
+    private fun startUpdate(a: Updater.Avail) {
+        updButton.isEnabled = false
+        thread(name = "update-download") {
+            val f = runCatching { Updater.download(this, a) }.onFailure { Updater.status = "Ошибка: ${it.message}"; RpcService.addLog("update: ${it.message}") }.getOrNull()
+            ui.post {
+                updButton.isEnabled = true
+                if (f != null) runCatching { Updater.install(this, f) }.onFailure { Updater.status = "Ошибка установки: ${it.message}" }
+                else Toast.makeText(this, Updater.status, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun toggleNode() {
@@ -128,65 +209,104 @@ class MainActivity : Activity() {
         if (RpcService.running) startService(i.setAction(RpcService.ACTION_STOP)) else startForegroundService(i)
     }
 
+    /** Persisted; if the node is running, the service restarts rpc-server on the new address right away. */
+    private fun toggleWifi() {
+        val on = !RpcService.wifiPref(this)
+        RpcService.setWifiPref(this, on)
+        if (RpcService.running) startForegroundService(Intent(this, RpcService::class.java).putExtra("wifi", on))
+        if (on && !batteryExempt()) requestBatteryExemption()
+        tick(reschedule = false)
+    }
+
+    private fun batteryExempt() = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+    private fun requestBatteryExemption() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).setData(Uri.parse("package:$packageName")))
+        }.onFailure { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+    }
+
     private fun report(): String {
         val m = memInfo()
         return "ARGUS node ${packageManager.getPackageInfo(packageName, 0).versionName} · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}\n" +
-            "state=${RpcService.state} port=${RpcService.port} threads=${RpcService.threads} variant=${RpcService.variant} cpu=${RpcService.coreTiers} cache=${fmtBytes(cacheSize)} restarts=${RpcService.restarts} lastExit=${RpcService.lastExit}\n" +
+            "state=${RpcService.state} mode=${if (RpcService.wifi) "wifi" else "usb"} host=${RpcService.host} ip=${RpcService.wifiIp} port=${RpcService.port} threads=${RpcService.threads} variant=${RpcService.variant} cpu=${RpcService.coreTiers} cache=${fmtBytes(cacheSize)} restarts=${RpcService.restarts} lastExit=${RpcService.lastExit}\n" +
             "ram free=${m.availMem shr 20}MB total=${m.totalMem shr 20}MB\n\n" + RpcService.logText()
     }
     private var cacheSize = -1L; private var cacheTick = 0
     private fun refreshCacheSize() { thread(name = "cache-size") { cacheSize = RpcService.cacheBytes(this) } }
     private fun clearCache() {
-        val warn = if (RpcService.clients > 0 && RpcService.state == RpcService.State.LINKED) " (PC is linked; the current model keeps working, next load re-sends weights)" else ""
+        val warn = if (RpcService.clients > 0 && RpcService.state == RpcService.State.LINKED) " (ПК подключён: текущая модель работает, при следующей загрузке веса передадутся заново)" else ""
         thread(name = "cache-clear") {
             RpcService.clearCache(this); cacheSize = RpcService.cacheBytes(this)
-            ui.post { Toast.makeText(this, "Cache cleared$warn", Toast.LENGTH_SHORT).show() }
+            ui.post { Toast.makeText(this, "Кэш очищен$warn", Toast.LENGTH_SHORT).show() }
         }
     }
     private fun fmtBytes(b: Long) = when { b < 0 -> "…"; b < 1L shl 20 -> "${b shr 10} KB"; b < 1L shl 30 -> "${b shr 20} MB"; else -> "%.1f GB".format(b / 1073741824.0) }
 
     private fun copyLog() {
         getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("argus-log", report()))
-        Toast.makeText(this, "Log copied", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Журнал скопирован", Toast.LENGTH_SHORT).show()
     }
     private fun shareLog() = startActivity(Intent.createChooser(
-        Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, report()), "Send log"))
+        Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, report()), "Отправить журнал"))
 
     private fun memInfo() = ActivityManager.MemoryInfo().also { getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
 
-    private fun tick() {
+    private fun tick(reschedule: Boolean = true) {
         val s = RpcService.state
         val (word, color, head, sub) = when (s) {
-            RpcService.State.OFF -> Quad("OFF", DIM, "Node is off", "Plug the tablet into the PC with Argus open — it starts automatically. Or press Start.")
-            RpcService.State.STARTING -> Quad("STARTING", AMBER, "Starting…", "Launching the compute server.")
-            RpcService.State.READY -> Quad("READY", CYAN, "Waiting for PC", "Server is up on port ${RpcService.port}. Argus on the PC will connect over USB.")
-            RpcService.State.LINKED -> Quad("LINKED", GREEN, "Connected to PC", "Sharing memory and CPU. Keep the cable in; the screen can be off.")
-            RpcService.State.RESTARTING -> Quad("RESTART", RED, "Recovering", "Server stopped (${RpcService.lastExit}). Restarting automatically. If this repeats, tap Share and send the log.")
+            RpcService.State.OFF -> Quad("OFF", DIM, "Узел выключен", if (RpcService.wifiPref(this)) "Wi-Fi режим включён: нажмите «Запустить узел» — Argus на ПК найдёт его в сети." else "Подключите устройство к ПК с открытым Argus — узел запустится сам. Или нажмите «Запустить».")
+            RpcService.State.STARTING -> Quad("STARTING", AMBER, "Запуск…", "Запускается вычислительный сервер.")
+            RpcService.State.READY -> Quad("READY", CYAN, "Ждёт ПК", if (RpcService.wifi) "Сервер слушает ${RpcService.wifiIp ?: "0.0.0.0"}:${RpcService.port}. Argus на ПК подключится по Wi-Fi или USB." else "Сервер запущен на порту ${RpcService.port}. Argus на ПК подключится по USB.")
+            RpcService.State.LINKED -> Quad("LINKED", GREEN, "ПК подключён", if (RpcService.wifi) "Делится памятью и CPU по Wi-Fi. Держите на зарядке; экран можно выключить." else "Делится памятью и CPU. Не отключайте кабель; экран можно выключить.")
+            RpcService.State.RESTARTING -> Quad("RESTART", RED, "Восстановление", "Сервер остановился (${RpcService.lastExit}). Перезапуск автоматически. Если повторяется — нажмите «Поделиться» и отправьте журнал.")
         }
         pill.text = word; pill.setTextColor(color); pill.background = box(PANEL, color, 10)
         title.text = head; title.setTextColor(if (s == RpcService.State.OFF) TEXT else color); hint.text = sub
-        toggle.text = if (RpcService.running) "Stop node" else "Start node"
+        toggle.text = if (RpcService.running) "Остановить узел" else "Запустить узел"
         toggle.setTextColor(if (RpcService.running) RED else CYAN); toggle.background = box(PANEL, if (RpcService.running) RED else CYAN, 4)
 
         val m = memInfo()
-        stat["RAM FREE"]!!.text = "%.1f GB".format(m.availMem / 1e9)
-        stat["RAM TOTAL"]!!.text = "%.1f GB".format(m.totalMem / 1e9)
+        stat["ОЗУ СВОБОДНО"]!!.text = "%.1f GB".format(m.availMem / 1e9)
+        stat["ОЗУ ВСЕГО"]!!.text = "%.1f GB".format(m.totalMem / 1e9)
         if (RpcService.bigCores == 0) RpcService.bigCores = RpcService.detectBigCores()
-        stat["CPU CORES"]!!.text = "${Runtime.getRuntime().availableProcessors()} (${RpcService.bigCores} big)"
-        stat["VARIANT"]!!.text = RpcService.variant
+        stat["ЯДРА CPU"]!!.text = "${Runtime.getRuntime().availableProcessors()} (${RpcService.bigCores} больш.)"
+        stat["ВАРИАНТ"]!!.text = RpcService.variant
         if (cacheTick++ % 5 == 0) refreshCacheSize()
-        stat["CACHE"]!!.text = fmtBytes(cacheSize)
-        stat["THREADS"]!!.text = if (RpcService.running) RpcService.threads.toString() else "—"
-        stat["PORT"]!!.text = if (RpcService.running) RpcService.port.toString() else "—"
-        stat["UPTIME"]!!.text = if (RpcService.running) fmtUp((SystemClock.elapsedRealtime() - RpcService.startedAt) / 1000) else "—"
-        stat["PC LINKS"]!!.text = RpcService.clients.toString()
-        stat["RESTARTS"]!!.text = RpcService.restarts.toString()
-        stat["RESTARTS"]!!.setTextColor(if (RpcService.restarts > 0) AMBER else TEXT)
+        stat["КЭШ"]!!.text = fmtBytes(cacheSize)
+        stat["ПОТОКИ"]!!.text = if (RpcService.running) RpcService.threads.toString() else "—"
+        stat["ПОРТ"]!!.text = if (RpcService.running) RpcService.port.toString() else "—"
+        stat["АПТАЙМ"]!!.text = if (RpcService.running) fmtUp((SystemClock.elapsedRealtime() - RpcService.startedAt) / 1000) else "—"
+        stat["ПОДКЛ. ПК"]!!.text = RpcService.clients.toString()
+        stat["РЕСТАРТЫ"]!!.text = RpcService.restarts.toString()
+        stat["РЕСТАРТЫ"]!!.setTextColor(if (RpcService.restarts > 0) AMBER else TEXT)
 
+        renderWifi()
         renderChecks()
+        updStatus.text = buildString {
+            if (Updater.progress >= 0) append("Загрузка: ${Updater.progress}%") else append(Updater.status)
+            Updater.pcHost?.let { if (isNotEmpty()) append(" · "); append("ПК Argus: $it") }
+        }.ifEmpty { "Обновления проверяются с ПК (Wi-Fi режим) или кнопкой — с GitHub." }
+        maybeAskUpdate()
         val text = RpcService.logText()
-        if (text != lastLog) { lastLog = text; logView.text = text.ifEmpty { "No output yet." }; logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) } }
-        ui.postDelayed(::tick, 1000)
+        if (text != lastLog) { lastLog = text; logView.text = text.ifEmpty { "Пока нет вывода." }; logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) } }
+        if (reschedule) ui.postDelayed({ tick() }, 1000)
+    }
+
+    private fun renderWifi() {
+        val on = RpcService.wifiPref(this)
+        wifiToggle.text = if (on) "Wi-Fi режим: вкл" else "Wi-Fi режим: выкл"
+        wifiToggle.setTextColor(if (on) GREEN else CYAN); wifiToggle.background = box(PANEL, if (on) GREEN else CYAN, 4)
+        val vis = if (on) View.VISIBLE else View.GONE
+        wifiAddr.visibility = vis; wifiInfo.visibility = vis; wifiWarn.visibility = vis
+        val ip = RpcService.wifiIp ?: RpcService.lanAddress()?.first?.hostAddress
+        wifiAddr.text = if (ip != null) "$ip:${RpcService.WIFI_PORT}" else "нет Wi-Fi"
+        wifiAddr.setTextColor(if (ip == null) RED else if (RpcService.running && RpcService.wifi) GREEN else TEXT)
+        wifiInfo.text = when {
+            !RpcService.running -> "Узел не запущен — нажмите «Запустить узел»."
+            !RpcService.wifi -> "Применяется…"
+            else -> "Слушает 0.0.0.0:${RpcService.port} · маяк UDP :${RpcService.BEACON_PORT} каждые 2 с (отправлено ${RpcService.beacons})"
+        }
+        wifiBattery.visibility = if (on && !batteryExempt()) View.VISIBLE else View.GONE
     }
 
     private fun renderChecks() {
@@ -194,11 +314,10 @@ class MainActivity : Activity() {
         val battery = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         val notif = Build.VERSION.SDK_INT < 33 || checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == 0
         checks.removeAllViews()
-        checks.addView(checkRow("USB debugging", adb, "Settings › Developer options › USB debugging") {
+        checks.addView(checkRow("Отладка по USB", adb, "Настройки › Для разработчиков › Отладка по USB") {
             startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) })
-        checks.addView(checkRow("Battery: unrestricted", battery, "Keeps the node alive with the screen off") {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) })
-        checks.addView(checkRow("Notifications", notif, "Needed to show the node is running") {
+        checks.addView(checkRow("Батарея: без ограничений", battery, "Узел не засыпает при выключенном экране") { requestBatteryExemption() })
+        checks.addView(checkRow("Уведомления", notif, "Нужны, чтобы показывать, что узел работает") {
             startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)) })
     }
 
@@ -211,7 +330,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             addView(label(name, 13f, TEXT, mono = false)); if (!ok) addView(label(help, 11f, DIM, mono = false))
         }, LinearLayout.LayoutParams(0, -2, 1f))
-        if (!ok) addView(btn("Fix", AMBER, fix))
+        if (!ok) addView(btn("Исправить", AMBER, fix))
     }
 
     private fun fmtUp(s: Long) = if (s < 3600) "%d:%02d".format(s / 60, s % 60) else "%dh%02dm".format(s / 3600, s / 60 % 60)

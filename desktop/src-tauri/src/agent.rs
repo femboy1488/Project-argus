@@ -30,7 +30,21 @@ fn expand(path: &str) -> PathBuf {
 #[serde(rename_all = "camelCase")]
 pub struct CommandResult { pub code: Option<i32>, pub stdout: String, pub stderr: String, pub timed_out: bool }
 
-/// PowerShell on Windows (sh elsewhere, for development).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformInfo { pub os: &'static str, pub shell: &'static str, pub screen: bool }
+
+/// What the agent runs on: the UI adapts tool descriptions (PowerShell vs bash) and hides screen tools.
+#[tauri::command]
+pub fn platform_info() -> PlatformInfo {
+    PlatformInfo {
+        os: crate::state::platform_name(),
+        shell: if cfg!(windows) { "PowerShell" } else { "bash" },
+        screen: cfg!(windows),
+    }
+}
+
+/// PowerShell on Windows, bash (or sh) on Linux/macOS.
 #[tauri::command]
 pub async fn agent_run_command(command: String, cwd: Option<String>, timeout_sec: Option<u64>) -> Result<CommandResult, String> {
     #[cfg(windows)]
@@ -42,7 +56,12 @@ pub async fn agent_run_command(command: String, cwd: Option<String>, timeout_sec
         c
     };
     #[cfg(not(windows))]
-    let mut c = { let mut c = hidden_command("sh"); c.args(["-c", &command]); c };
+    let mut c = {
+        let shell = if std::path::Path::new("/bin/bash").exists() || std::path::Path::new("/usr/bin/bash").exists() { "bash" } else { "sh" };
+        let mut c = hidden_command(shell);
+        c.args(["-c", &command]).env("LANG", std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()));
+        c
+    };
     if let Some(d) = cwd.as_deref().filter(|d| !d.trim().is_empty()) { c.current_dir(expand(d)); }
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true)
         .spawn().map_err(|e| format!("не удалось запустить: {e}"))?;
@@ -234,7 +253,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::Shot;
-    const NA: &str = "управление экраном доступно только в Windows-сборке";
+    const NA: &str = "скриншоты и управление мышью/клавиатурой пока доступны только в Windows-сборке Argus";
     pub fn screenshot(_: u32) -> Result<(Shot, f64, i32, i32), String> { Err(NA.into()) }
     pub fn mouse(_: &str, _: i32, _: i32) -> Result<(), String> { Err(NA.into()) }
     pub fn type_text(_: &str) -> Result<(), String> { Err(NA.into()) }

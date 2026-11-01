@@ -5,30 +5,44 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- rpc-server binds a socket on 127.0.0.1; adb forward reaches it over USB -->
+    <!-- rpc-server binds 127.0.0.1 (USB, via adb forward) or 0.0.0.0 in Wi-Fi mode -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Wi-Fi mode: WifiLock, MulticastLock (UDP broadcast beacon on :50053), DhcpInfo -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 0.3.1 self-update: PackageInstaller session; Android still asks the user to confirm every install -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:label="Argus Node" android:icon="@mipmap/ic_launcher"
         android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- exported so `adb shell am start-foreground-service` (shell uid) can start it.
-             It only listens on loopback, so other apps gain nothing by starting it. -->
+        <!-- exported so `adb shell am start-foreground-service` (shell uid) can start it
+             (boolean extra "wifi"=true switches to Wi-Fi mode). USB mode listens on loopback only. -->
         <service
             android:name=".RpcService"
             android:exported="true"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Runs a local llama.cpp RPC compute worker for a USB-connected PC" />
+                android:value="Runs a llama.cpp RPC compute worker for the user's PC over USB or home Wi-Fi" />
         </service>
+        <!-- PackageInstaller status (explicit PendingIntent) + restart the node after its own update -->
+        <receiver android:name=".UpdateReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

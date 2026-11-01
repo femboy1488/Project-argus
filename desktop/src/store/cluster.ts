@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ChatMessage, ClusterSnapshot, Conversation, ModelRunState, SpeedSettings } from "../lib/types";
+import type { ChatMessage, ClusterSnapshot, Conversation, ModelRunState, SpeedSettings, UpdateProgress, UpdateStatus } from "../lib/types";
 import { uid } from "../lib/format";
 
 export type View = "chat" | "devices" | "models" | "api";
@@ -9,6 +9,7 @@ export const SYSTEM_PRESETS: { id: string; label: string; prompt: string }[] = [
   { id: "assistant", label: "Ассистент (RU)", prompt: "Ты полезный ассистент. Отвечай по-русски, кратко и по делу." },
   { id: "coder", label: "Программист", prompt: "You are a senior software engineer. Answer with correct, minimal code in fenced blocks, then a short explanation." },
   { id: "translator", label: "Переводчик RU⇄EN", prompt: "Переводи текст пользователя: с русского на английский, с любого другого — на русский. Только перевод, без комментариев." },
+  { id: "argus-net", label: "Помощник: сеть кластера Argus", prompt: "Ты — помощник по кластеру Argus 0.3. Отвечай по-русски, коротко, по шагам. Команды cmd давай одной строкой.\n\nКак устроен кластер: ПК с Windows — хост, на нём llama-server (llama.cpp b12008) держит часть слоёв модели в видеопамяти и раздаёт остальные нодам через RPC. Android-нода — приложение Argus Node с rpc-server на порту 50052; подключается по USB, ПК сам ставит и обновляет приложение и пробрасывает порт (adb forward, на ПК порты 50053, 50054 и дальше). Сетевая нода — любое устройство в той же сети с rpc-server: Android в «Wi-Fi режиме» или Linux/Raspberry Pi со скриптом argus-node-linux.sh сами появляются в Cluster → «Найдено в сети» (кнопка «Добавить»), остальное — вручную: «Добавить ноду по IP» → IP:50052. Слои делятся по свободной памяти и весу скорости нод; самое медленное звено тормозит всех.\n\nПравила сети: только закрытая домашняя сеть, у RPC нет пароля — порт 50052 никогда не открывать в интернет. USB быстрее и стабильнее Wi-Fi; по сети лучше кабель или 5 ГГц. Все ноды на одной версии llama.cpp (b12008), иначе ошибка протокола. Если нода отключилась, движок останавливается, а когда она вернётся — модель перезапускается сама (или кнопка «Перезапустить движок»); новую ноду в работающую модель добавляет «Перезапустить движок». Зависшую ноду лечит кнопка «Переподключить» в инспекторе.\n\nПодключение Android: Режим разработчика → Отладка по USB, кабель с данными, принять RSA-запрос («Всегда разрешать»). Стадии: Installing/Updating → Forwarding → Starting → Syncing → ONLINE. На устройстве строка VARIANT (baseline / dotprod / i8mm) показывает сборку под процессор.\n\nЧастые проблемы:\n- Устройство не видно: другой кабель или порт, переподключить отладку, принять RSA.\n- «Shell does not have permission to access user 150»: Защищённая папка или Dual Messenger Samsung; исправлено в новой сборке, обновить Argus.\n- Нода не стартует: открыть Argus Node на устройстве, посмотреть лог (Copy).\n- Модель не грузится: Models → Engine log или %TEMP%\\argus-engine.log, смотреть первые строки ошибки; проверить fit-check.\n- Медленно: убрать слабые ноды или снизить их вес, меньше контекст, модель поменьше.\n- API для Hermes, Open WebUI, Jan: http://127.0.0.1:8080/v1; Hermes нужен контекст 64K.\n\nЕсли не хватает данных — попроси точный текст ошибки, модель устройства, VARIANT и tok/s. Не выдумывай функций, которых нет." },
   { id: "analyst", label: "Аналитик документов", prompt: "Ты аналитик. Внимательно читай приложенные файлы, цитируй факты, отмечай, чего в них нет." },
 ];
 
@@ -58,6 +59,22 @@ interface State {
   engineLog: string[];
   dlBytes: number;
   modelsTab: "curated" | "hf";
+  toasts: { id: string; kind: "info" | "warn" | "error" | "ok"; text: string }[];
+  /** self-update (0.3.1) — the app always asks; «Позже» lasts for this session */
+  update: UpdateStatus | null;
+  updateDialog: boolean;
+  aboutOpen: boolean;
+  updProgress: UpdateProgress | null;
+  updateLater: string[];        // desktop versions answered «Позже» this session
+  nodeLater: string[];          // "<node id>|<version>" answered «Позже» this session
+  setUpdate: (u: UpdateStatus) => void;
+  setUpdateDialog: (o: boolean) => void;
+  setAbout: (o: boolean) => void;
+  setUpdProgress: (p: UpdateProgress | null) => void;
+  laterUpdate: (v: string) => void;
+  laterNode: (key: string) => void;
+  pushToast: (kind: "info" | "warn" | "error" | "ok", text: string) => void;
+  dismissToast: (id: string) => void;
   setModelsTab: (t: "curated" | "hf") => void;
   setDl: (b: number) => void;
   pushEngineLog: (l: string) => void;
@@ -108,6 +125,25 @@ export const useCluster = create<State>((set, get) => {
     engineLog: [],
     dlBytes: 0,
     modelsTab: "curated",
+    toasts: [],
+    update: null,
+    updateDialog: false,
+    aboutOpen: false,
+    updProgress: null,
+    updateLater: [],
+    nodeLater: [],
+    setUpdate: (update) => set({ update }),
+    setUpdateDialog: (updateDialog) => set({ updateDialog }),
+    setAbout: (aboutOpen) => set({ aboutOpen }),
+    setUpdProgress: (updProgress) => set({ updProgress }),
+    laterUpdate: (v) => set((s) => ({ updateLater: [...s.updateLater, v], updateDialog: false })),
+    laterNode: (k) => set((s) => ({ nodeLater: [...s.nodeLater, k] })),
+    pushToast: (kind, text) => {
+      const id = uid();
+      set((s) => (s.toasts.some((t) => t.text === text) ? {} : { toasts: [...s.toasts.slice(-4), { id, kind, text }] }));
+      setTimeout(() => get().dismissToast(id), kind === "error" || kind === "warn" ? 9000 : 6000);
+    },
+    dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
     setModelsTab: (modelsTab) => set({ modelsTab }),
     setDl: (dlBytes) => set({ dlBytes }),
     pushEngineLog: (l) => set((s) => {

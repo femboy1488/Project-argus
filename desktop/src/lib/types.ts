@@ -22,6 +22,36 @@ export interface ClusterNode {
   version: string | null; // node app version (USB) / rpc protocol (LAN)
   rpcDevices: number;
   integrated: boolean;
+  attempts: number;        // failed provisioning attempts in a row (USB)
+  retryIn: number | null;  // seconds until the automatic retry (USB, stage error)
+  variant: string | null;  // rpc-server build from the Wi-Fi beacon
+  beacon: boolean;         // announced by UDP beacon (Wi-Fi mode)
+  inEngine: boolean;       // part of the running engine's --rpc list
+  appVc: number | null;    // Argus Node versionCode (USB: dumpsys, Wi-Fi: beacon "vc")
+  appVersion: string | null; // Argus Node versionName from the Wi-Fi beacon
+  updateAvailable: string | null; // bundled node version when this node is older («Нода устарела»)
+  updateSkipped: boolean;  // «Пропустить эту версию» chosen for exactly that version
+}
+
+/** A node heard on UDP :50053 (Argus Node Wi-Fi mode / argus-node-linux.sh). */
+export interface DiscoveredNode {
+  id: string; endpoint: string; name: string; ramMb: number; freeMb: number;
+  variant: string | null; ageSec: number; added: boolean;
+  appVersion: string | null; appVc: number | null; outdated: boolean;
+}
+
+export type EngineStatus = "idle" | "loading" | "ready" | "broken";
+
+/** Rust-side supervisor view of llama-server (also pushed as the `engine-state` event, + optional toast). */
+export interface EngineView {
+  status: EngineStatus;
+  reason: string | null;
+  alias: string | null;
+  nodes: string[];
+  pendingRestart: boolean;
+  newNodes: boolean;
+  canRestart: boolean;
+  toast?: string;
 }
 
 export interface SplitEntry { id: string; device: string; name: string; share: number }
@@ -36,7 +66,39 @@ export interface ClusterSnapshot {
   split: SplitEntry[];
   fastStart: boolean;
   bundledNodeVersion: string;
+  discovered: DiscoveredNode[];
+  autoAddDiscovered: boolean;
+  beaconError: string;
+  adbOk: boolean;
+  engine: EngineView;
+  platform: "windows" | "linux" | "macos";
+  appVersion: string;            // desktop version (Cargo.toml)
+  bundledNodeVc: number | null;  // versionCode of resources/node.apk
 }
+
+/** Mirrors updater.rs */
+export interface ReleaseAsset { name: string; url: string; size: number }
+export interface Release {
+  version: string; tag: string; name: string; notes: string; url: string; publishedAt: string;
+  asset: ReleaseAsset | null; hasSums: boolean;
+}
+export interface UpdateStatus {
+  current: string;
+  installKind: "nsis" | "portable" | "appimage" | "deb" | "other";
+  latest: Release | null;
+  available: boolean;
+  skipped: boolean;
+  checkEnabled: boolean;
+  checking: boolean;
+  lastCheck: number | null;
+  error: string | null;
+  busy: boolean;
+  phase: string;
+  done: number;
+  total: number;
+  nodeServerError: string;
+}
+export interface UpdateProgress { phase: string; done: number; total: number }
 
 export interface ModelEntry {
   id: string;
@@ -95,6 +157,8 @@ export type ModelRunState =
   | { status: "idle" }
   | { status: "loading"; model: ModelEntry; log?: string }
   | { status: "ready"; model: ModelEntry; endpoint: string }
+  /** engine died or lost a node; Rust restarts it when the cluster is back (pendingRestart) */
+  | { status: "broken"; model: ModelEntry; reason: string }
   | { status: "error"; message: string };
 
 export interface SpeedSettings {

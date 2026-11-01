@@ -1,10 +1,17 @@
 // Agent mode: OpenAI-style tool calling against the local llama-server (--jinja).
 // Every tool call goes through `confirm` (UI card) before it reaches Rust.
-import { chatWithTools, runTool, type ApiMessage } from "./api";
+import { chatWithTools, runTool, type ApiMessage, type PlatformInfo } from "./api";
 import type { ChatMessage, ToolCall } from "./types";
 import { uid } from "./format";
 
 export const MAX_STEPS = 20;
+
+/** Host OS (Rust platform_info): PowerShell on Windows, bash on Linux; screen tools only where supported. */
+export let PLATFORM: PlatformInfo = { os: "windows", shell: "PowerShell", screen: true };
+export function setPlatform(p: PlatformInfo) {
+  PLATFORM = p;
+  TOOL_LABEL.run_command = `Команда ${p.shell}`;
+}
 
 interface ToolDef { name: string; description: string; dangerous: boolean; parameters: Record<string, unknown> }
 const obj = (props: Record<string, unknown>, required: string[] = []) => ({ type: "object", properties: props, required });
@@ -33,16 +40,27 @@ export const TOOL_LABEL: Record<string, string> = {
 
 export const isDangerous = (name: string) => TOOLS.find((t) => t.name === name)?.dangerous ?? true;
 
+const SCREEN_TOOLS = ["screenshot", "mouse_click", "mouse_move", "type_text", "key_press"];
+
+function describe(t: ToolDef): ToolDef {
+  if (t.name !== "run_command" || PLATFORM.os === "windows") return t;
+  return { ...t, description: `Run a ${PLATFORM.shell} command on the user's ${PLATFORM.os === "linux" ? "Linux" : "macOS"} PC and return stdout/stderr.`,
+    parameters: obj({ command: str(`${PLATFORM.shell} command`), cwd: str("Working directory (optional)"), timeout_sec: num("Timeout in seconds, default 60") }, ["command"]) };
+}
+
 export function toolSchemas(dangerous: boolean, vision: boolean) {
-  return TOOLS.filter((t) => (dangerous || !t.dangerous) && (vision || !["mouse_click", "mouse_move"].includes(t.name)))
+  return TOOLS.filter((t) => (dangerous || !t.dangerous) && (vision || !["mouse_click", "mouse_move"].includes(t.name))
+      && (PLATFORM.screen || !SCREEN_TOOLS.includes(t.name)))
+    .map(describe)
     .map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
 }
 
 export const AGENT_SYSTEM = (vision: boolean, dangerous: boolean) =>
-  `You are Argus Agent, running locally on the user's Windows PC. Use the provided tools to complete the task step by step. ` +
+  `You are Argus Agent, running locally on the user's ${PLATFORM.os === "linux" ? "Linux" : PLATFORM.os === "macos" ? "macOS" : "Windows"} PC (shell: ${PLATFORM.shell}). Use the provided tools to complete the task step by step. ` +
   `Call one tool at a time, look at the result, then decide the next step. When the task is done, reply with a short summary in the user's language without calling tools. ` +
   (dangerous ? "" : "Only read-only tools are enabled; if the task needs commands, file writes or input control, say that the user must enable dangerous tools. ") +
-  (vision ? "You can see screenshots: take one before clicking, and use pixel coordinates from the latest screenshot. " : "You cannot see images; do not try to control the mouse. ") +
+  (!PLATFORM.screen ? "Screen capture and mouse/keyboard control are not available on this OS. " :
+   vision ? "You can see screenshots: take one before clicking, and use pixel coordinates from the latest screenshot. " : "You cannot see images; do not try to control the mouse. ") +
   "Every action is shown to the user, who may decline it.";
 
 export type Decision = "allow" | "allow-all" | "deny";

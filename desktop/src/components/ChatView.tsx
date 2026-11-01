@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { Bot, Boxes, MessageSquarePlus, ShieldAlert, ShieldCheck, Trash2, X } from "lucide-react";
 import { useCluster, activeConversation, SYSTEM_PRESETS } from "../store/cluster";
-import { engineHasVision, streamChat } from "../lib/api";
+import { chatErrorText, engineHasVision, streamChat, trackGeneration } from "../lib/api";
 import { uid } from "../lib/format";
-import { MAX_STEPS, TOOL_LABEL, isDangerous, runAgent, toApi, AGENT_SYSTEM, type Decision } from "../lib/agent";
+import { MAX_STEPS, PLATFORM, TOOL_LABEL, isDangerous, runAgent, toApi, AGENT_SYSTEM, type Decision } from "../lib/agent";
+import EngineBanner from "./EngineBanner";
 import { AGENT_MODELS, MODELS } from "../lib/models";
 import type { ChatMessage, ToolCall } from "../lib/types";
 import MessageBubble from "./MessageBubble";
@@ -39,14 +40,16 @@ export default function ChatView() {
   async function generate(history: ChatMessage[]) {
     const convId = conv.id;
     const st = useCluster.getState();
-    abort.current = new AbortController();
+    const ctrl = new AbortController();
+    abort.current = ctrl;
+    const untrack = trackGeneration(ctrl); // aborted with a reason if the engine dies / loses a node
     setBusy(true);
     try {
       if (conv.agent) {
         const vision = await engineHasVision();
         setStep(0);
         await runAgent(history, AGENT_SYSTEM(vision, dangerous) + (conv.systemPrompt ? `\n\n${conv.systemPrompt}` : ""),
-          { dangerous, vision, signal: abort.current.signal }, {
+          { dangerous, vision, signal: ctrl.signal }, {
             push: (m) => st.pushMessage(m, convId),
             patch: (id, p) => st.patchMessage(id, p, convId),
             onStep: setStep,
@@ -66,16 +69,23 @@ export default function ChatView() {
         server = true; st.patchMessage(aid, { tps: x.tps, promptTps: x.promptTps, tokens: x.tokens, ttftMs: x.ttftMs }, convId);
       };
       try {
-        for await (const chunk of streamChat(toApi([...sys(), ...history], false), abort.current.signal, onStats)) {
+        for await (const chunk of streamChat(toApi([...sys(), ...history], false), ctrl.signal, onStats)) {
           n++; const now = performance.now(); if (!first) first = now;
           if (!server && n > 1) st.patchMessage(aid, { tokens: n, ttftMs: first - t0, tps: (n - 1) / ((now - first) / 1000) }, convId);
           st.appendToMessage(aid, chunk, convId);
         }
       } finally { st.patchMessage(aid, { pending: false }, convId); }
     } catch (e) {
-      if ((e as Error).name !== "AbortError")
-        st.pushMessage({ id: uid(), role: "assistant", content: `**[ошибка]** ${(e as Error).message}` }, convId);
+      let text = chatErrorText(e, ctrl.signal);
+      if (text?.startsWith("Нет связи")) {
+        // the socket usually dies a moment before the supervisor's engine-state event: prefer its precise reason
+        await new Promise((r) => setTimeout(r, 1500));
+        const r = useCluster.getState().run;
+        if (r.status === "broken") text = `Генерация прервана: ${r.reason}`;
+      }
+      if (text) st.pushMessage({ id: uid(), role: "assistant", content: `**[ошибка]** ${text}` }, convId);
     } finally {
+      untrack();
       setPending(null);
       setBusy(false);
       // mark any dangling pending assistant message as finished
@@ -135,10 +145,13 @@ export default function ChatView() {
             </button>
           </div>
         </div>
+        <EngineBanner compact />
         <div className="min-h-0 flex-1 overflow-y-auto">
           {messages.length === 0 ? (
             <div className="dot-grid flex h-full flex-col items-center justify-center p-6 text-center">
-              {ready ? (
+              {run.status === "broken" ? (
+                <div className="max-w-md text-xs text-pl-mute">Движок остановлен. Как только кластер восстановится, модель {run.model.name} перезапустится автоматически.</div>
+              ) : ready ? (
                 <>
                   <div className="label">{conv.agent ? "Режим агента" : "Движок готов"}</div>
                   <div className="mt-2 text-lg text-pl-text">{run.model.name} распределена по {snapshot?.split.length || 1} устройствам</div>
@@ -165,7 +178,9 @@ export default function ChatView() {
         </div>
         <PromptBar busy={busy} disabled={!ready} onSend={send} onStop={stop} draft={draft} onDraftUsed={draftUsed}
           hint={conv.agent ? `агент · шаг ${step}/${MAX_STEPS} · каждое действие подтверждается` : undefined}
-          placeholder={ready ? (conv.agent ? "Задача для агента: например, «найди в Загрузках самый большой файл»" : `Запрос к ${run.model.name}…`) : "Сначала загрузите модель"} />
+          placeholder={ready ? (conv.agent ? "Задача для агента: например, «найди в Загрузках самый большой файл»" : `Запрос к ${run.model.name}…`)
+            : run.status === "broken" ? "Движок остановлен — ждём ноды или нажмите «Перезапустить движок»"
+            : run.status === "loading" ? `Загрузка ${run.model.name}…` : "Сначала загрузите модель"} />
       </div>
       {conv.agent
         ? <AgentPanel dangerous={dangerous} setDangerous={(v) => { setDangerous(v); localStorage.setItem("argus.agentDangerous", v ? "1" : "0"); }}
@@ -211,7 +226,7 @@ function ConfirmCard({ call, onDecide }: { call: ToolCall; onDecide: (d: Decisio
         {danger ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />} Агент хочет: {TOOL_LABEL[call.name] ?? call.name}
       </div>
       <pre className="max-h-48 overflow-auto whitespace-pre-wrap p-3 font-mono text-xs text-pl-text">
-        {call.name === "run_command" ? `PS> ${args.command}${args.cwd ? `\n(в папке ${args.cwd})` : ""}`
+        {call.name === "run_command" ? `${PLATFORM.os === "windows" ? "PS>" : "$"} ${args.command}${args.cwd ? `\n(в папке ${args.cwd})` : ""}`
           : call.name === "write_file" ? `${args.path}\n──────\n${String(args.content ?? "").slice(0, 1500)}`
           : JSON.stringify(args, null, 2)}
       </pre>

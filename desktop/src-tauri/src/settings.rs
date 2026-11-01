@@ -1,5 +1,5 @@
 //! Persistent user settings (JSON in the app config dir): LAN nodes, per-device speed weights,
-//! disabled devices, fast start.
+//! disabled devices, fast start, Wi-Fi auto-add, keep-loaded + last deploy, update checks / skipped versions.
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -13,6 +13,9 @@ pub struct LanNode {
     pub port: u16,
     #[serde(default)]
     pub name: String,
+    /// added from a Wi-Fi beacon (Argus Node "Wi-Fi режим" / argus-node-linux.sh)
+    #[serde(default)]
+    pub auto: bool,
 }
 
 impl LanNode {
@@ -32,11 +35,25 @@ pub struct Settings {
     pub enabled: HashSet<String>,
     /// skip re-provisioning a USB node whose rpc-server is already running the bundled version
     pub fast_start: bool,
+    /// add nodes found by UDP beacon (port 50053) without asking
+    pub auto_add_discovered: bool,
+    /// mirrors the UI toggle "держать модель загруженной": engine survives Argus restarts
+    pub keep_loaded: bool,
+    /// last deploy (re-attach / auto-restart after an Argus restart with keep_loaded)
+    pub last_launch: Option<crate::llama::StartModelArgs>,
+    /// «Проверять обновления» (GitHub releases/latest at start + every 6 h). Installing always needs a click.
+    pub check_updates: bool,
+    /// «Пропустить эту версию» for the desktop app ("0.3.2")
+    pub skipped_version: Option<String>,
+    /// «Пропустить эту версию» for the bundled node APK ("0.3.1 (5)") — USB nodes are not offered it again
+    pub skipped_node_version: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lan_nodes: vec![], weights: HashMap::new(), disabled: HashSet::new(), enabled: HashSet::new(), fast_start: true }
+        Self { lan_nodes: vec![], weights: HashMap::new(), disabled: HashSet::new(), enabled: HashSet::new(), fast_start: true,
+               auto_add_discovered: false, keep_loaded: true, last_launch: None,
+               check_updates: true, skipped_version: None, skipped_node_version: None }
     }
 }
 
@@ -52,7 +69,10 @@ impl Settings {
         let Some(p) = path else { return };
         if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            if let Err(e) = std::fs::write(p, s) { log::warn!("settings save {}: {e}", p.display()); }
+            // write + rename: a crash mid-write must not wipe the LAN node list
+            let tmp = p.with_extension("json.tmp");
+            let r = std::fs::write(&tmp, s).and_then(|_| std::fs::rename(&tmp, p));
+            if let Err(e) = r { log::warn!("settings save {}: {e}", p.display()); }
         }
     }
 }

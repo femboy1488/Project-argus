@@ -1,6 +1,6 @@
 [package]
 name = "usb-cluster"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2021"
 
 [build-dependencies]
@@ -14,6 +14,9 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 sysinfo = "0.32"
 log = "0.4"
+# 0.3.1 self-update: GitHub releases (rustls + ring, no OpenSSL / no system TLS), SHA-256 verification
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
 
 # Agent mode: screenshot + mouse/keyboard (Windows only; stubs elsewhere)
 [target.'cfg(windows)'.dependencies]

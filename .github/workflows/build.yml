@@ -1,0 +1,187 @@
+# Free GitHub Actions build: Android rpc-server -> node.apk -> Windows installer + Linux AppImage/.deb with everything bundled.
+# Push this repo to GitHub, open Actions, run "build" — artifacts appear on the run page.
+# Tag push vX.Y.Z (e.g. `git tag v0.3.1 && git push --tags`) additionally publishes a GitHub Release with
+# Argus-Setup.exe, Argus-Node.apk, the Linux AppImage/.deb and SHA256SUMS.txt — the files Argus' updater
+# looks for (it refuses an update without SHA256SUMS.txt). The tag must match the app version.
+name: build
+on: { workflow_dispatch: {}, push: { tags: ["v*"] } }
+permissions: { contents: write }   # softprops/action-gh-release
+
+env:
+  LLAMA_REF: b12008   # ONE llama.cpp version for both sides — RPC protocol must match
+
+jobs:
+  rpc-server-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ggml-rpc-server for arm64-v8a
+        run: ANDROID_NDK=$ANDROID_NDK_LATEST_HOME ./android/scripts/build-rpc-server.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: librpc_server, path: android/app/src/main/jniLibs/arm64-v8a/librpc_server.so }
+
+  node-apk:
+    needs: rpc-server-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: librpc_server, path: android/app/src/main/jniLibs/arm64-v8a }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.9" }
+      - run: gradle -p android assembleRelease
+      # Android only installs an update signed with the SAME key. Put the release keystore (the one that signed the
+      # APKs your users have, android/argus-debug.jks for 0.2–0.3.1) into secret ANDROID_KEYSTORE_B64 (+ ANDROID_KEYSTORE_PASS).
+      # Without it the CI APK is signed with a throwaway debug key and can NOT update an installed node.
+      - name: Sign node.apk with the Argus key
+        env: { KS: "${{ secrets.ANDROID_KEYSTORE_B64 }}", KS_PASS: "${{ secrets.ANDROID_KEYSTORE_PASS }}" }
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > argus.jks
+            BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+            $BT/zipalign -f -p 4 $APK aligned.apk
+            $BT/apksigner sign --ks argus.jks --ks-pass "pass:${KS_PASS:-argus123}" --out node.apk aligned.apk
+            rm -f argus.jks
+          else
+            echo "::warning::ANDROID_KEYSTORE_B64 not set — node.apk is signed with a CI debug key and cannot update existing installs"
+            cp $APK node.apk
+          fi
+          VC=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' android/app/build.gradle.kts)
+          VN=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' android/app/build.gradle.kts)
+          printf '%s (%s)' "$VN" "$VC" > node.version
+          cat node.version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-apk
+          path: |
+            node.apk
+            node.version
+
+  desktop-windows:
+    needs: node-apk
+    runs-on: windows-latest
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with: { name: node-apk, path: desktop/src-tauri/resources }
+      - name: Bundle llama-server (CUDA 12.4, RPC enabled) + adb
+        run: |
+          R=desktop/src-tauri/resources
+          base=https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_REF
+          curl -sSL -o llama.zip  $base/llama-$LLAMA_REF-bin-win-cuda-12.4-x64.zip
+          curl -sSL -o cudart.zip $base/cudart-llama-bin-win-cuda-12.4-x64.zip
+          curl -sSL -o pt.zip https://dl.google.com/android/repository/platform-tools-latest-windows.zip
+          7z x -y llama.zip -o$R >/dev/null
+          7z x -y cudart.zip -o$R >/dev/null
+          7z x -y pt.zip -opt >/dev/null && cp pt/platform-tools/{adb.exe,AdbWinApi.dll,AdbWinUsbApi.dll} $R/
+          ls $R
+      - run: npm ci
+        working-directory: desktop
+      # our own NSIS script (windows-installer.nsi): /S /UPDATE silent self-update + relaunch, same as the sandbox build
+      - run: npx tauri build --no-bundle
+        working-directory: desktop
+      - name: Installer (makensis) -> Argus-Setup.exe
+        run: |
+          set -e
+          V=$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")
+          curl -fsSL -o vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+          W=$(cygpath -w "$PWD")
+          "/c/Program Files (x86)/NSIS/makensis.exe" -V2 -DVERSION=$V \
+            "-DAPP_EXE=$W\\desktop\\src-tauri\\target\\release\\usb-cluster.exe" \
+            "-DRES_DIR=$W\\desktop\\src-tauri\\resources" \
+            "-DICON=$W\\desktop\\src-tauri\\icons\\icon.ico" \
+            "-DVC_REDIST=$W\\vc_redist.x64.exe" \
+            "-DOUT_FILE=$W\\Argus-Setup.exe" \
+            desktop/src-tauri/windows-installer.nsi
+          ls -l Argus-Setup.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: argus-windows, path: Argus-Setup.exe }
+
+  # Linux desktop: AppImage + .deb with llama-server b12008 (Vulkan, x64) and adb bundled.
+  # Runtime needs a Vulkan driver (mesa-vulkan-drivers / NVIDIA) and, for USB nodes, Android udev rules
+  # (package android-sdk-platform-tools-common) so adb can open the device without root.
+  desktop-linux:
+    needs: node-apk
+    runs-on: ubuntu-22.04
+    env:
+      NO_STRIP: "true"   # linuxdeploy's bundled strip chokes on newer .so files
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System libraries (Tauri 2 / webkit2gtk-4.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf libssl-dev build-essential curl wget file unzip
+      - uses: actions/download-artifact@v4
+        with: { name: node-apk, path: desktop/src-tauri/resources }
+      - name: Bundle llama-server (Vulkan, RPC) + adb
+        run: |
+          set -e
+          R=desktop/src-tauri/resources
+          base=https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_REF
+          curl -fsSL -o llama.tgz $base/llama-$LLAMA_REF-bin-ubuntu-vulkan-x64.tar.gz
+          mkdir -p llama && tar -xzf llama.tgz -C llama --strip-components=1
+          cp llama/llama-server $R/
+          # shared libs by SONAME (RUNPATH=$ORIGIN); skip unversioned symlinks and other tools' *-impl.so
+          for f in llama/*.so*; do
+            b=$(basename "$f")
+            case "$b" in *-impl.so) [ "$b" = libllama-server-impl.so ] || continue ;; esac
+            if [ -L "$f" ] && [ -e "$f.0" ]; then continue; fi
+            case "$b" in *.so|*.so.0) cp -L "$f" "$R/$b" ;; esac
+          done
+          curl -fsSL -o pt.zip https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          unzip -q pt.zip && cp platform-tools/adb $R/
+          chmod +x $R/llama-server $R/adb
+          ls -la $R
+      - run: npm ci
+        working-directory: desktop
+      - run: npx tauri build --bundles appimage,deb
+        working-directory: desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: argus-linux
+          path: |
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+
+  # Tag push vX.Y.Z -> GitHub Release with every asset + SHA256SUMS.txt (Argus' updater requires the checksums).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [node-apk, desktop-windows, desktop-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Collect assets + SHA256SUMS.txt
+        run: |
+          set -e
+          V=$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")
+          [ "${GITHUB_REF_NAME}" = "v$V" ] || { echo "::error::tag ${GITHUB_REF_NAME} != app version v$V (tauri.conf.json)"; exit 1; }
+          mkdir -p dist
+          cp artifacts/argus-windows/Argus-Setup.exe dist/
+          cp artifacts/node-apk/node.apk dist/Argus-Node.apk
+          find artifacts/argus-linux -name '*.AppImage' -exec cp {} dist/ \;
+          find artifacts/argus-linux -name '*.deb' -exec cp {} dist/ \;
+          bash scripts/make-release-assets.sh dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Argus ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/Argus-Setup.exe
+            dist/Argus-Node.apk
+            dist/*.AppImage
+            dist/*.deb
+            dist/SHA256SUMS.txt

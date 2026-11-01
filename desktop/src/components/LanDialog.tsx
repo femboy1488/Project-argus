@@ -5,8 +5,9 @@ import { addLanNode, testLanNode } from "../lib/api";
 import { Copy } from "lucide-react";
 
 const CMDS: { os: string; cmd: string }[] = [
-  { os: "Raspberry Pi / Linux", cmd: "./rpc-server -H 0.0.0.0 -p 50052 -c" },
-  { os: "Windows (ноутбук/ПК)", cmd: "rpc-server.exe -H 0.0.0.0 -p 50052 -c" },
+  { os: "Linux / Pi (авто, с маяком)", cmd: "bash scripts/argus-node-linux.sh" },
+  { os: "Linux / Pi (вручную)", cmd: "./ggml-rpc-server -H 0.0.0.0 -p 50052 -c" },
+  { os: "Windows (ноутбук/ПК)", cmd: "ggml-rpc-server.exe -H 0.0.0.0 -p 50052 -c" },
 ];
 
 /** "Добавить ноду по IP": host:port of a machine running llama.cpp rpc-server (b12008). */
@@ -54,7 +55,8 @@ export default function LanDialog() {
           <div className="border border-pl-line bg-pl-bg0 p-3 text-xs leading-5 text-pl-mute">
             <div className="label mb-1">Как запустить ноду на Pi / ноутбуке</div>
             <ol className="list-decimal space-y-1 pl-4">
-              <li>Возьмите <span className="text-pl-text">rpc-server</span> из llama.cpp <span className="font-mono text-pl-gold">b12008</span> (та же версия, что у Argus — протокол RPC v8). Linux/Pi: <span className="font-mono">cmake -B build -DGGML_RPC=ON &amp;&amp; cmake --build build --target rpc-server</span>; Windows: архив релиза b12008 с GitHub.</li>
+              <li>Проще всего: Android — «Wi-Fi режим» в Argus Node; Linux-ПК / Raspberry Pi — скрипт <span className="font-mono text-pl-text">scripts/argus-node-linux.sh</span> (скачает rpc-server b12008 и включит маяк). Такие ноды сами появятся в Cluster → «Найдено в сети».</li>
+              <li>Вручную: <span className="text-pl-text">ggml-rpc-server</span> из релиза llama.cpp <span className="font-mono text-pl-gold">b12008</span> (та же версия, что у Argus — протокол RPC v8).</li>
               <li>Запустите на той машине:</li>
             </ol>
             {CMDS.map((c) => <Cmd key={c.os} os={c.os} cmd={c.cmd} />)}

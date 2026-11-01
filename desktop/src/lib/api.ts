@@ -1,5 +1,5 @@
 // Thin bridge to the Rust side. Falls back to mock data when opened in a plain browser (npm run dev).
-import type { ClusterNode, ClusterSnapshot, ModelEntry, SplitEntry } from "./types";
+import type { ClusterNode, ClusterSnapshot, DiscoveredNode, EngineView, ModelEntry, SplitEntry, UpdateProgress, UpdateStatus } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 export const LLAMA_URL = "http://127.0.0.1:8080";
@@ -32,7 +32,84 @@ export async function onDownload(cb: (bytes: number) => void): Promise<() => voi
   return listen<number>("llama-dl", (e) => cb(e.payload));
 }
 
+export async function onEngineState(cb: (e: EngineView) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<EngineView>("engine-state", (e) => cb(e.payload));
+}
+
+export interface Toast { kind: "info" | "warn" | "error" | "ok"; text: string }
+export async function onToast(cb: (t: Toast) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<Toast>("argus-toast", (e) => cb(e.payload));
+}
+
+// ---- running generations: aborted with a clear reason when the engine dies or loses a node
+/** Abort reason used when the engine (not the user) ended the request. */
+export class EngineDownError extends Error {
+  constructor(message: string) { super(message); this.name = "EngineDownError"; }
+}
+const generations = new Set<AbortController>();
+export function trackGeneration(c: AbortController): () => void {
+  generations.add(c);
+  return () => { generations.delete(c); };
+}
+export function abortGenerations(reason: string) {
+  for (const c of generations) { try { c.abort(new EngineDownError(reason)); } catch { c.abort(); } }
+  generations.clear();
+}
+/** Human-readable Russian text for a failed chat request. */
+export function chatErrorText(e: unknown, signal?: AbortSignal): string | null {
+  const r = signal?.reason;
+  if (r instanceof EngineDownError) return `Генерация прервана: ${r.message}`;
+  if (e instanceof EngineDownError) return `Генерация прервана: ${e.message}`;
+  const err = e as Error;
+  if (err?.name === "AbortError") return null; // the user pressed Stop
+  const m = String(err?.message ?? e);
+  if (err instanceof TypeError || /Failed to fetch|NetworkError|Load failed|network error|ECONNREFUSED/i.test(m))
+    return "Нет связи с движком (llama-server не отвечает) — возможно, он остановился. Подробности в журнале движка (Models).";
+  return m;
+}
+
+// ---- self-update (0.3.1): every install starts from a user click
+export async function onUpdateAvailable(cb: (s: UpdateStatus) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<UpdateStatus>("update-available", (e) => cb(e.payload));
+}
+export async function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<UpdateProgress>("update-progress", (e) => cb(e.payload));
+}
+const mockUpdate = (): UpdateStatus => ({
+  current: "0.3.1", installKind: "nsis", available: true, skipped: false, checkEnabled: true, checking: false,
+  lastCheck: Math.floor(Date.now() / 1000), error: null, busy: false, phase: "", done: 0, total: 0, nodeServerError: "",
+  latest: { version: "0.3.2", tag: "v0.3.2", name: "Argus 0.3.2", url: "https://github.com/femboy1488/Project-argus/releases",
+    publishedAt: new Date().toISOString(), hasSums: true, asset: { name: "Argus-Setup.exe", url: "", size: 46_000_000 },
+    notes: "## Что нового\n- Пример заметок к релизу\n- **markdown** поддерживается" },
+});
+export const updateStatus = () => (isTauri ? tauriInvoke<UpdateStatus>("update_status") : Promise.resolve(mockUpdate()));
+export const checkUpdates = () => (isTauri ? tauriInvoke<UpdateStatus>("check_updates") : Promise.resolve(mockUpdate()));
+export const setUpdateCheck = (enabled: boolean) => (isTauri ? tauriInvoke<void>("set_update_check", { enabled }) : Promise.resolve());
+export const skipUpdateVersion = (version: string) => (isTauri ? tauriInvoke<void>("skip_update_version", { version }) : Promise.resolve());
+/** "installing" (the app exits and the installer relaunches it) | "opened" (release page opened) */
+export const installUpdate = () => (isTauri ? tauriInvoke<string>("install_update") : Promise.resolve("opened"));
+export const updateUsbNode = (id: string) => (isTauri ? tauriInvoke<void>("update_usb_node", { id }) : Promise.resolve());
+export const skipNodeUpdate = (version: string) => (isTauri ? tauriInvoke<void>("skip_node_update", { version }) : Promise.resolve());
+export const wifiNodeUpdate = (id: string) => (isTauri ? tauriInvoke<string>("wifi_node_update", { id }) : Promise.resolve("Запрос отправлен (mock)"));
+
 export const rescan = () => (isTauri ? tauriInvoke<void>("rescan") : Promise.resolve());
+export const reconnectNode = (id: string) => (isTauri ? tauriInvoke<void>("reconnect_node", { id }) : Promise.resolve());
+export const restartEngine = () => (isTauri ? tauriInvoke<string>("restart_engine") : Promise.resolve(LLAMA_URL));
+export const addDiscoveredNode = (id: string) =>
+  isTauri ? tauriInvoke<string>("add_discovered_node", { id }) : (mockAddLan(id.replace(/^lan:/, ""), mock.found.find((d) => d.id === id)?.name), Promise.resolve(id));
+export const setAutoAdd = (enabled: boolean) => (isTauri ? tauriInvoke<void>("set_auto_add", { enabled }) : (mock.autoAdd = enabled, Promise.resolve()));
+
+export interface PlatformInfo { os: "windows" | "linux" | "macos"; shell: string; screen: boolean }
+export const platformInfo = (): Promise<PlatformInfo> =>
+  isTauri ? tauriInvoke<PlatformInfo>("platform_info") : Promise.resolve({ os: "windows", shell: "PowerShell", screen: true });
 
 export interface StartOpts {
   ctx?: number; lan?: boolean; needMb?: number;
@@ -63,6 +140,8 @@ export const setNodeWeight = (id: string, weight: number) =>
   isTauri ? tauriInvoke<void>("set_node_weight", { id, weight }) : (mock.weights[id] = weight, Promise.resolve());
 export const setNodeEnabled = (id: string, enabled: boolean) =>
   isTauri ? tauriInvoke<void>("set_node_enabled", { id, enabled }) : (mock.disabled[id] = !enabled, Promise.resolve());
+export const setKeepLoaded = (enabled: boolean) =>
+  isTauri ? tauriInvoke<void>("set_keep_loaded", { enabled }) : Promise.resolve();
 export const setFastStart = (enabled: boolean) =>
   isTauri ? tauriInvoke<void>("set_fast_start", { enabled }) : Promise.resolve();
 
@@ -108,14 +187,14 @@ export async function waitHealthy(timeoutMs = 60 * 60_000) {
   if (!isTauri) return new Promise<void>((r) => setTimeout(r, 1200)); // browser demo
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    if (!(await modelStatus())) throw new Error("Engine stopped — see the engine log for the reason");
+    if (!(await modelStatus())) throw new Error("Движок остановился при загрузке — причина в журнале движка ниже");
     try {
       const r = await fetch(`${LLAMA_URL}/health`);
       if (r.ok) return;
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 1000));
   }
-  throw new Error("Model did not become ready in 60 min");
+  throw new Error("Модель не загрузилась за 60 минут");
 }
 
 /** Is an engine already serving (kept loaded from a previous session)? Returns the model alias. */
@@ -154,6 +233,8 @@ export async function* streamChat(messages: ApiMessage[], signal?: AbortSignal, 
     signal,
   });
   if (!res.ok || !res.body) throw new Error(`llama-server: HTTP ${res.status} ${await res.text().catch(() => "")}`);
+  // a reader stuck on a dead socket must end as soon as the request is aborted
+  signal?.addEventListener("abort", () => { res.body?.cancel(signal.reason).catch(() => {}); }, { once: true });
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -213,6 +294,11 @@ export async function chatWithTools(messages: ApiMessage[], tools: unknown[], si
 // ---------------------------------------------------------------- browser mocks
 
 const mock = {
+  found: [
+    { id: "lan:192.168.1.77:50052", endpoint: "192.168.1.77:50052", name: "Pixel 7 (Wi-Fi)", ramMb: 7600, freeMb: 3900, variant: "i8mm", ageSec: 1, added: false, appVersion: "0.3", appVc: 4, outdated: true },
+    { id: "lan:192.168.1.30:50052", endpoint: "192.168.1.30:50052", name: "raspberrypi 5", ramMb: 8000, freeMb: 7100, variant: "aarch64", ageSec: 0, added: false, appVersion: null, appVc: null, outdated: false },
+  ] as DiscoveredNode[],
+  autoAdd: false,
   lan: [] as ClusterNode[],
   weights: {} as Record<string, number>,
   disabled: {} as Record<string, boolean>,
@@ -220,7 +306,9 @@ const mock = {
 
 const base = (o: Partial<ClusterNode> & Pick<ClusterNode, "id" | "name" | "kind">): ClusterNode => ({
   stage: "connected", transport: "usb", endpoint: null, totalMb: 0, availableMb: 0, usableMb: 0, loadPct: 0, error: null,
-  weight: 1, enabled: true, device: null, version: null, rpcDevices: 1, integrated: false, ...o,
+  weight: 1, enabled: true, device: null, version: null, rpcDevices: 1, integrated: false,
+  attempts: 0, retryIn: null, variant: null, beacon: false, inEngine: false,
+  appVc: null, appVersion: null, updateAvailable: null, updateSkipped: false, ...o,
 });
 
 function mockAddLan(address: string, name?: string) {
@@ -241,7 +329,7 @@ function mockSnapshot(): ClusterSnapshot {
       usableMb: 3584, loadPct: 20 + j(), weight: w("gpu:Vulkan0", 2), enabled: en("gpu:Vulkan0") }),
   ];
   const tab = base({ id: "R52T1234", name: "Galaxy Tab S6 Lite", kind: "tablet", endpoint: "127.0.0.1:50052", totalMb: 8192,
-    availableMb: 5200, usableMb: 3640, loadPct: 10 + j(), version: "0.2.0", weight: w("R52T1234", 1), enabled: en("R52T1234") });
+    availableMb: 5200, usableMb: 3640, loadPct: 10 + j(), version: "0.3 (4)", appVc: 4, updateAvailable: "0.3.1 (5)", weight: w("R52T1234", 1), enabled: en("R52T1234") });
   const lan = mock.lan.map((n) => ({ ...n, weight: w(n.id, 1), enabled: en(n.id), loadPct: 5 + j() / 3 }));
   const nodes = [tab, ...lan];
   const g = gpus.filter((x) => x.enabled);
@@ -255,7 +343,10 @@ function mockSnapshot(): ClusterSnapshot {
   const split: SplitEntry[] = devs.map((d) => ({ id: d.id, device: d.device, name: d.name, share: d.s / tot }));
   return { host, gpus, nodes, totalMb: host.totalMb + act.reduce((a, n) => a + n.totalMb, 0),
     usableMb: host.usableMb + act.reduce((a, n) => a + n.usableMb, 0), rpcServers: act.map((n) => n.endpoint!), split,
-    fastStart: true, bundledNodeVersion: "0.2.0" };
+    fastStart: true, bundledNodeVersion: "0.3.1 (5)", appVersion: "0.3.1", bundledNodeVc: 5,
+    discovered: mock.found.map((d) => ({ ...d, added: mock.lan.some((n) => n.id === d.id) })), autoAddDiscovered: mock.autoAdd,
+    beaconError: "", adbOk: true, platform: "windows",
+    engine: { status: "idle", reason: null, alias: null, nodes: [], pendingRestart: false, newNodes: false, canRestart: false } };
 }
 
 let mockStep = 0;

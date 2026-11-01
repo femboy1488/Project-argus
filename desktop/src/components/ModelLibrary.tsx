@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useCluster } from "../store/cluster";
 import { CTX_PRESETS, DRAFT_CHOICES, MODELS, bestPick, draftFor, fitLevel, requiredMb } from "../lib/models";
-import { openExternal, setFastStart, stopModel } from "../lib/api";
+import { openExternal, setFastStart, setKeepLoaded, stopModel } from "../lib/api";
 import { deploy } from "../lib/launch";
+import EngineBanner from "./EngineBanner";
 import { gb, pct } from "../lib/format";
 import Meter from "./Meter";
 import HfBrowser from "./HfBrowser";
@@ -67,7 +68,7 @@ export default function ModelLibrary() {
                     const fit = fitLevel(m, usable, ctx);
                     const [label, cls, tone] = fitTag[fit];
                     const need = requiredMb(m, ctx);
-                    const active = (run.status === "loading" || run.status === "ready") && run.model.id === m.id;
+                    const active = (run.status === "loading" || run.status === "ready" || run.status === "broken") && run.model.id === m.id;
                     const isBest = best?.id === m.id;
                     return (
                       <tr key={m.id} className={clsx("border-b border-pl-line", active ? "bg-pl-blue2/20" : isBest ? "bg-pl-gold/[0.07]" : "odd:bg-pl-bg1 even:bg-[#20252c] hover:bg-pl-bg3",
@@ -91,7 +92,7 @@ export default function ModelLibrary() {
                           <button className="btn mr-1 px-1.5" title="Открыть на HF" onClick={() => openExternal(hfUrl(m.hfRepo))}><ExternalLink size={11} /></button>
                           {active ? (
                             <button className="btn" onClick={() => { stopModel(); setRun({ status: "idle" }); }}>
-                              {run.status === "loading" ? <><Loader2 size={12} className="animate-spin" /> Loading</> : <><Square size={11} /> Stop</>}
+                              {run.status === "loading" ? <><Loader2 size={12} className="animate-spin" /> Loading</> : run.status === "broken" ? <><Square size={11} /> Stop (остановлен)</> : <><Square size={11} /> Stop</>}
                             </button>
                           ) : (
                             <button className="btn-primary" disabled={fit === "too-heavy" || run.status === "loading"} onClick={() => deploy(m)} data-tour={isBest ? "deploy" : undefined}>
@@ -107,6 +108,7 @@ export default function ModelLibrary() {
             </div>
           )}
           {run.status === "error" && <div className="m-3 border-l-2 border-pl-red bg-pl-red/10 p-2 font-mono text-2xs text-pl-red">{run.message}</div>}
+          {run.status === "broken" && <EngineBanner />}
         </div>
         <SpeedPanel />
       </div>
@@ -117,7 +119,7 @@ export default function ModelLibrary() {
 
 function SpeedPanel() {
   const { speed, setSpeed, run, snapshot } = useCluster();
-  const target = run.status === "ready" || run.status === "loading" ? run.model : bestPick(snapshot?.usableMb ?? 0);
+  const target = run.status === "ready" || run.status === "loading" || run.status === "broken" ? run.model : bestPick(snapshot?.usableMb ?? 0);
   const draft = target ? draftFor(target, speed.draft) : undefined;
   return (
     <div className="panel flex min-h-0 flex-col overflow-y-auto">
@@ -138,7 +140,7 @@ function SpeedPanel() {
           </div>
         )}
         <Toggle on={speed.promptCache} set={(v) => setSpeed({ promptCache: v })} label="Кэш промпта" sub="--cache-reuse 256: длинная переписка не пересчитывается заново" />
-        <Toggle on={speed.keepLoaded} set={(v) => setSpeed({ keepLoaded: v })} label="Держать модель загруженной" sub="между чатами и перезапусками Argus; повторный Deploy той же модели мгновенный" />
+        <Toggle on={speed.keepLoaded} set={(v) => { setSpeed({ keepLoaded: v }); setKeepLoaded(v); }} label="Держать модель загруженной" sub="между чатами и перезапусками Argus; повторный Deploy той же модели мгновенный" />
         <Toggle on={speed.fastStart} set={(v) => { setSpeed({ fastStart: v }); setFastStart(v); }} label="Быстрый старт нод" sub="не перезапускать rpc-server на устройстве, если он уже работает с той же версией" />
         <p className="border-t border-pl-line pt-2 text-2xs leading-4 text-pl-dim">Спекуляция помогает, когда основная модель большая и частично на телефонах: черновик (0.6–2B) считается локально, а дорогой проход по кабелю проверяет сразу пачку токенов.</p>
       </div>

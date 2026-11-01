@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+desktop/src-tauri/gen/
+# big prebuilt binaries: CI downloads them; ship builds via GitHub Releases
+desktop/src-tauri/resources/*.dll
+desktop/src-tauri/resources/*.exe
+desktop/src-tauri/resources/*.apk
+*.apk
+*.jks
+*.idsig
