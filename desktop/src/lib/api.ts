@@ -164,7 +164,7 @@ export interface HelperChatOpts {
 }
 export const helperChat = (messages: ApiMessage[], o: HelperChatOpts = {}) =>
   isTauri ? tauriInvoke<HelperReply>("helper_chat", {
-    node: o.node ?? null, messages, maxTokens: o.maxTokens ?? null, streamId: o.streamId ?? null, temperature: o.temperature ?? null,
+    node: o.node ?? null, messages: normalizeMessages(messages), maxTokens: o.maxTokens ?? null, streamId: o.streamId ?? null, temperature: o.temperature ?? null,
   }) : mockHelperChat(messages, o);
 export const helperCancel = (streamId: string) =>
   isTauri ? tauriInvoke<void>("helper_cancel", { streamId }) : (mock.cancelled.add(streamId), Promise.resolve());
@@ -323,6 +323,28 @@ export async function engineHasVision(): Promise<boolean> {
 export interface ChatStats { tps: number; promptTps?: number; tokens: number; ttftMs?: number; final?: boolean }
 export type ApiMessage = { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; name?: string };
 
+/** Many chat templates (Mistral, Gemma, Llama 2…) throw "Conversation roles must alternate user/assistant".
+ *  Make the history safe for any template: one system message first, no empty turns, no two user/assistant
+ *  turns in a row (merged), and the first turn after system is a user turn. Tool turns are left as they are. */
+export function normalizeMessages(input: ApiMessage[]): ApiMessage[] {
+  const isEmpty = (c: unknown) => c == null || (typeof c === "string" && !c.trim()) || (Array.isArray(c) && c.length === 0);
+  const toParts = (c: unknown): unknown[] => Array.isArray(c) ? c : [{ type: "text", text: String(c ?? "") }];
+  const join = (a: unknown, b: unknown): unknown =>
+    typeof a === "string" && typeof b === "string" ? `${a}\n\n${b}` : [...toParts(a), ...toParts(b)];
+  const sys: string[] = [];
+  const out: ApiMessage[] = [];
+  for (const m of input) {
+    if (m.role === "system") { const t = typeof m.content === "string" ? m.content : JSON.stringify(m.content); if (t.trim()) sys.push(t); continue; }
+    const plain = (m.role === "user" || m.role === "assistant") && !m.tool_calls && !m.tool_call_id;
+    if (plain && isEmpty(m.content)) continue;
+    const prev = out[out.length - 1];
+    if (plain && prev && prev.role === m.role && !prev.tool_calls && !prev.tool_call_id) { prev.content = join(prev.content, m.content); continue; }
+    out.push({ ...m });
+  }
+  while (out.length && out[0].role !== "user") out.shift();
+  return [...(sys.length ? [{ role: "system", content: sys.join("\n\n") }] : []), ...out];
+}
+
 export async function* streamChat(messages: ApiMessage[], signal?: AbortSignal, onStats?: (s: ChatStats) => void, maxTokens?: number, base: string = LLAMA_URL) {
   if (!isTauri) { // browser demo
     const demo = "Слои 0–15 лежат в VRAM видеокарты, слои 16–31 считает телефон через rpc-server по USB.\n\n"
@@ -334,7 +356,7 @@ export async function* streamChat(messages: ApiMessage[], signal?: AbortSignal, 
   const res = await fetch(`${base.replace(/\/+$/, "")}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, stream: true, timings_per_token: true, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
+    body: JSON.stringify({ messages: normalizeMessages(messages), stream: true, timings_per_token: true, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
     signal,
   });
   if (!res.ok || !res.body) throw new Error(`llama-server: HTTP ${res.status} ${await res.text().catch(() => "")}`);
@@ -379,7 +401,7 @@ export async function chatWithTools(messages: ApiMessage[], tools: unknown[], si
   const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, tools, tool_choice: "auto", stream: false, parse_tool_calls: true }),
+    body: JSON.stringify({ messages: normalizeMessages(messages), tools, tool_choice: "auto", stream: false, parse_tool_calls: true }),
     signal,
   });
   if (!res.ok) throw new Error(`llama-server: HTTP ${res.status} ${await res.text().catch(() => "")}`);

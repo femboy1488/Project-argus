@@ -241,3 +241,52 @@ mod tests {
         assert!(f.extra.contains_key("queue"));
     }
 }
+
+/// Many chat templates (Mistral, Gemma, Llama 2…) throw "Conversation roles must alternate user/assistant".
+/// Same rules as normalizeMessages() in the UI: one system message first, no empty turns, consecutive
+/// user/assistant turns merged, first turn after system is a user turn. Tool turns are left as they are.
+pub fn normalize_messages(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let Some(arr) = v.as_array() else { return v.clone() };
+    let empty = |c: &Value| c.is_null() || c.as_str().map_or(false, |s| s.trim().is_empty()) || c.as_array().map_or(false, |a| a.is_empty());
+    let parts = |c: &Value| -> Vec<Value> { match c { Value::Array(a) => a.clone(), Value::String(s) => vec![json!({"type":"text","text":s})], o => vec![json!({"type":"text","text":o.to_string()})] } };
+    let mut sys: Vec<String> = vec![];
+    let mut out: Vec<Value> = vec![];
+    for m in arr {
+        let role = m["role"].as_str().unwrap_or("");
+        if role == "system" {
+            let t = m["content"].as_str().map(str::to_string).unwrap_or_else(|| m["content"].to_string());
+            if !t.trim().is_empty() { sys.push(t); }
+            continue;
+        }
+        let plain = (role == "user" || role == "assistant") && m.get("tool_calls").is_none() && m.get("tool_call_id").is_none();
+        if plain && empty(&m["content"]) { continue; }
+        if let Some(prev) = out.last_mut() {
+            let prev_plain = prev.get("tool_calls").is_none() && prev.get("tool_call_id").is_none();
+            if plain && prev_plain && prev["role"].as_str() == Some(role) {
+                let merged = match (prev["content"].as_str(), m["content"].as_str()) {
+                    (Some(a), Some(b)) => Value::String(format!("{a}\n\n{b}")),
+                    _ => { let mut p = parts(&prev["content"]); p.extend(parts(&m["content"])); Value::Array(p) }
+                };
+                prev["content"] = merged;
+                continue;
+            }
+        }
+        out.push(m.clone());
+    }
+    while out.first().map_or(false, |m| m["role"].as_str() != Some("user")) { out.remove(0); }
+    if !sys.is_empty() { out.insert(0, json!({"role":"system","content": sys.join("\n\n")})); }
+    Value::Array(out)
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use serde_json::json;
+    #[test]
+    fn alternates() {
+        let v = json!([{"role":"system","content":"a"},{"role":"assistant","content":"hi"},{"role":"user","content":"1"},
+            {"role":"user","content":"2"},{"role":"assistant","content":""},{"role":"system","content":"b"},{"role":"user","content":"3"}]);
+        let r = super::normalize_messages(&v);
+        assert_eq!(r, json!([{"role":"system","content":"a\n\nb"},{"role":"user","content":"1\n\n2\n\n3"}]));
+    }
+}

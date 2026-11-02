@@ -450,7 +450,7 @@ async fn chat(app: &AppHandle, base: &str, messages: serde_json::Value, max_toke
               temperature: Option<f32>) -> anyhow::Result<(String, Option<f64>, Option<u64>, u64)> {
     let t0 = Instant::now();
     let body = serde_json::json!({
-        "messages": messages, "stream": true, "max_tokens": max_tokens.unwrap_or(512),
+        "messages": crate::features::normalize_messages(&messages), "stream": true, "max_tokens": max_tokens.unwrap_or(512),
         "temperature": temperature.unwrap_or(0.4),
         // Qwen3 small models: no thinking, answer straight away
         "chat_template_kwargs": { "enable_thinking": false },
