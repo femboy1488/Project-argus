@@ -110,7 +110,7 @@ pub async fn supervise(st: Arc<AppState>) {
 
 async fn ask(st: &AppState, messages: Vec<Value>, prompt: &str) -> anyhow::Result<String> {
     let t = crate::features::route(st, prompt, false).await;
-    let mut body = json!({ "model": t.model, "messages": crate::features::normalize_messages(&Value::Array(messages)), "stream": false });
+    let mut body = json!({ "model": t.model, "messages": crate::features::prepare_messages(&t.base, &Value::Array(messages)).await, "stream": false });
     if t.kind == "helper" { body["chat_template_kwargs"] = json!({ "enable_thinking": false }); }
     let r = http().post(format!("{}/v1/chat/completions", t.base)).json(&body).timeout(Duration::from_secs(1800)).send().await
         .map_err(|e| anyhow::anyhow!(if t.kind == "main" { format!("модель не запущена в Argus ({e})") } else { format!("помощник недоступен ({e})") }))?;

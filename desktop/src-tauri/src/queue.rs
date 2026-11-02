@@ -192,8 +192,10 @@ async fn process_file(q: &Q, id: &str, client: &reqwest::Client, job: &Job, f: &
 }
 
 async fn complete(client: &reqwest::Client, sys: &str, user: &str) -> Result<String, String> {
+    let msgs = crate::features::prepare_messages(&format!("http://127.0.0.1:{LLAMA_PORT}"),
+        &serde_json::json!([{"role": "system", "content": sys}, {"role": "user", "content": user}])).await;
     let body = serde_json::json!({
-        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        "messages": msgs,
         "stream": false, "temperature": 0.3,
     });
     let r = client.post(format!("http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions")).json(&body)

@@ -732,6 +732,7 @@ async fn warmup(app: &AppHandle, st: &Arc<AppState>, system: Option<String>) {
     let mut messages = vec![];
     if let Some(sys) = system.filter(|s| !s.trim().is_empty()) { messages.push(serde_json::json!({ "role": "system", "content": sys })); }
     messages.push(serde_json::json!({ "role": "user", "content": "Привет" }));
+    let messages = crate::features::prepare_messages(&format!("http://127.0.0.1:{LLAMA_PORT}"), &serde_json::Value::Array(messages)).await;
     let body = serde_json::json!({ "messages": messages, "max_tokens": 1, "temperature": 0, "cache_prompt": true,
                                    "chat_template_kwargs": { "enable_thinking": false } });
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_default();

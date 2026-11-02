@@ -175,9 +175,9 @@ pub fn inspect(messages: &serde_json::Value) -> (String, bool) {
 async fn chat(sock: &mut TcpStream, st: &AppState, body: &[u8]) -> std::io::Result<()> {
     let Ok(mut req) = serde_json::from_slice::<serde_json::Value>(body) else { return json_err(sock, 400, "неверный JSON").await };
     let (prompt, attach) = inspect(&req["messages"]);
-    req["messages"] = crate::features::normalize_messages(&req["messages"]);
     let target = crate::features::route(st, &prompt, attach).await;
     req["model"] = target.model.clone().into();
+    req["messages"] = crate::features::prepare_messages(&target.base, &req["messages"]).await;
     if req.get("stream").is_none() { req["stream"] = true.into(); }
     if target.kind == "helper" { req["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false }); }
     let resp = http().post(format!("{}/v1/chat/completions", target.base)).json(&req).timeout(Duration::from_secs(1800)).send().await;

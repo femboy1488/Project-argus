@@ -245,7 +245,9 @@ mod tests {
 /// Many chat templates (Mistral, Gemma, Llama 2…) throw "Conversation roles must alternate user/assistant".
 /// Same rules as normalizeMessages() in the UI: one system message first, no empty turns, consecutive
 /// user/assistant turns merged, first turn after system is a user turn. Tool turns are left as they are.
-pub fn normalize_messages(v: &serde_json::Value) -> serde_json::Value {
+pub fn normalize_messages(v: &serde_json::Value) -> serde_json::Value { normalize_messages_ex(v, false) }
+
+pub fn normalize_messages_ex(v: &serde_json::Value, fold_system: bool) -> serde_json::Value {
     use serde_json::{json, Value};
     let Some(arr) = v.as_array() else { return v.clone() };
     let empty = |c: &Value| c.is_null() || c.as_str().map_or(false, |s| s.trim().is_empty()) || c.as_array().map_or(false, |a| a.is_empty());
@@ -275,8 +277,33 @@ pub fn normalize_messages(v: &serde_json::Value) -> serde_json::Value {
         out.push(m.clone());
     }
     while out.first().map_or(false, |m| m["role"].as_str() != Some("user")) { out.remove(0); }
-    if !sys.is_empty() { out.insert(0, json!({"role":"system","content": sys.join("\n\n")})); }
+    if !sys.is_empty() {
+        let st = sys.join("\n\n");
+        if fold_system {
+            if let Some(first) = out.first_mut() {
+                first["content"] = match first["content"].as_str() {
+                    Some(b) => Value::String(format!("{st}\n\n{b}")),
+                    None => { let mut p = vec![json!({"type":"text","text":st})]; p.extend(parts(&first["content"])); Value::Array(p) }
+                };
+            } else { out.push(json!({"role":"user","content": st})); }
+        } else { out.insert(0, json!({"role":"system","content": st})); }
+    }
     Value::Array(out)
+}
+
+/// Gemma-style templates have no system role. Ask the server which template it runs.
+pub async fn template_lacks_system(base: &str) -> bool {
+    static C: OnceLock<reqwest::Client> = OnceLock::new();
+    let c = C.get_or_init(|| reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap_or_default());
+    let Ok(r) = c.get(format!("{}/props", base.trim_end_matches('/'))).send().await else { return false };
+    let Ok(j) = r.json::<serde_json::Value>().await else { return false };
+    let t = j["chat_template"].as_str().unwrap_or("");
+    !t.is_empty() && (!t.contains("system") || t.contains("System role not supported") || t.contains("start_of_turn"))
+}
+
+/// normalize + fold system into the first user turn when the server's template needs it.
+pub async fn prepare_messages(base: &str, v: &serde_json::Value) -> serde_json::Value {
+    normalize_messages_ex(v, template_lacks_system(base).await)
 }
 
 #[cfg(test)]
@@ -288,5 +315,7 @@ mod normalize_tests {
             {"role":"user","content":"2"},{"role":"assistant","content":""},{"role":"system","content":"b"},{"role":"user","content":"3"}]);
         let r = super::normalize_messages(&v);
         assert_eq!(r, json!([{"role":"system","content":"a\n\nb"},{"role":"user","content":"1\n\n2\n\n3"}]));
+        let f = super::normalize_messages_ex(&v, true);
+        assert_eq!(f, json!([{"role":"user","content":"a\n\nb\n\n1\n\n2\n\n3"}]));
     }
 }

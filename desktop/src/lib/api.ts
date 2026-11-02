@@ -326,7 +326,7 @@ export type ApiMessage = { role: string; content: unknown; tool_calls?: unknown;
 /** Many chat templates (Mistral, Gemma, Llama 2…) throw "Conversation roles must alternate user/assistant".
  *  Make the history safe for any template: one system message first, no empty turns, no two user/assistant
  *  turns in a row (merged), and the first turn after system is a user turn. Tool turns are left as they are. */
-export function normalizeMessages(input: ApiMessage[]): ApiMessage[] {
+export function normalizeMessages(input: ApiMessage[], foldSystem = false): ApiMessage[] {
   const isEmpty = (c: unknown) => c == null || (typeof c === "string" && !c.trim()) || (Array.isArray(c) && c.length === 0);
   const toParts = (c: unknown): unknown[] => Array.isArray(c) ? c : [{ type: "text", text: String(c ?? "") }];
   const join = (a: unknown, b: unknown): unknown =>
@@ -342,7 +342,27 @@ export function normalizeMessages(input: ApiMessage[]): ApiMessage[] {
     out.push({ ...m });
   }
   while (out.length && out[0].role !== "user") out.shift();
-  return [...(sys.length ? [{ role: "system", content: sys.join("\n\n") }] : []), ...out];
+  if (!sys.length) return out;
+  const sysText = sys.join("\n\n");
+  if (foldSystem) { // Gemma-style templates have no system role: put it at the top of the first user turn
+    if (out.length) out[0] = { ...out[0], content: join(sysText, out[0].content) };
+    else out.push({ role: "user", content: sysText });
+    return out;
+  }
+  return [{ role: "system", content: sysText }, ...out];
+}
+
+/** True when the loaded model's chat template has no system role (Gemma and friends). */
+export function templateLacksSystem(tpl: string): boolean {
+  return !!tpl && (!/system/.test(tpl) || /System role not supported/i.test(tpl) || /start_of_turn/.test(tpl));
+}
+async function foldSystemFor(base: string): Promise<boolean> {
+  try {
+    const r = await fetch(`${base.replace(/\/+$/, "")}/props`, { signal: AbortSignal.timeout(2000) });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return templateLacksSystem(String(j?.chat_template ?? ""));
+  } catch { return false; }
 }
 
 export async function* streamChat(messages: ApiMessage[], signal?: AbortSignal, onStats?: (s: ChatStats) => void, maxTokens?: number, base: string = LLAMA_URL) {
@@ -353,10 +373,11 @@ export async function* streamChat(messages: ApiMessage[], signal?: AbortSignal, 
     let n = 0; for (const w of demo.split(/(?<= )/)) { if (signal?.aborted || (maxTokens && n >= maxTokens)) return; await new Promise((r) => setTimeout(r, 20)); n++; onStats?.({ tps: 7.4, promptTps: 41.2, tokens: n, ttftMs: 820 }); yield w; }
     return;
   }
+  const fold = await foldSystemFor(base);
   const res = await fetch(`${base.replace(/\/+$/, "")}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages: normalizeMessages(messages), stream: true, timings_per_token: true, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
+    body: JSON.stringify({ messages: normalizeMessages(messages, fold), stream: true, timings_per_token: true, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
     signal,
   });
   if (!res.ok || !res.body) throw new Error(`llama-server: HTTP ${res.status} ${await res.text().catch(() => "")}`);
@@ -401,7 +422,7 @@ export async function chatWithTools(messages: ApiMessage[], tools: unknown[], si
   const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages: normalizeMessages(messages), tools, tool_choice: "auto", stream: false, parse_tool_calls: true }),
+    body: JSON.stringify({ messages: normalizeMessages(messages, await foldSystemFor(LLAMA_URL)), tools, tool_choice: "auto", stream: false, parse_tool_calls: true }),
     signal,
   });
   if (!res.ok) throw new Error(`llama-server: HTTP ${res.status} ${await res.text().catch(() => "")}`);
