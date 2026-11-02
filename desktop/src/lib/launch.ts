@@ -1,7 +1,7 @@
 // One place that turns "deploy this model" into start_model args (speed toggles, split hint, draft).
-import { useCluster } from "../store/cluster";
+import { activeConversation, useCluster } from "../store/cluster";
 import { startModel, waitHealthy, probeRunningEngine, isTauri, abortGenerations } from "./api";
-import { draftFor, requiredMb, MODELS } from "./models";
+import { draftFor, findModel, requiredMb } from "./models";
 import type { EngineView, ModelEntry } from "./types";
 
 const LS_LAST = "argus.lastModel";
@@ -21,6 +21,8 @@ export async function deploy(m: ModelEntry, opts: { goChat?: boolean } = {}) {
       draftHf, draftMax: speed.draftMax,
       cacheReuse: speed.promptCache ? 256 : undefined,
       keepLoaded: speed.keepLoaded,
+      // «Прогрев…»: the engine processes this chat's system prompt once right after load (prompt cache)
+      warmupSystem: activeConversation(st).systemPrompt || undefined,
     });
     await waitHealthy();
     useCluster.getState().setRun({ status: "ready", model: m, endpoint });
@@ -38,7 +40,7 @@ function modelForAlias(alias: string | null): ModelEntry | undefined {
   let m: ModelEntry | undefined;
   try { m = JSON.parse(localStorage.getItem(LS_LAST) ?? "null") ?? undefined; } catch { /* */ }
   if (m && m.id === alias) return m;
-  return MODELS.find((x) => x.id === alias)
+  return findModel(alias)
     ?? { id: alias, name: alias, family: "?", params: "?", quant: "?", sizeGb: 0, hfRepo: "", kvMbPer1k: 0, tags: [] };
 }
 
@@ -81,7 +83,7 @@ export async function reattach() {
   if (!alias) return;
   let m: ModelEntry | undefined;
   try { m = JSON.parse(localStorage.getItem(LS_LAST) ?? "null") ?? undefined; } catch { /* */ }
-  m = m && m.id === alias ? m : MODELS.find((x) => x.id === alias) ?? m;
+  m = m && m.id === alias ? m : findModel(alias) ?? m;
   if (!m) m = { id: alias, name: alias, family: "?", params: "?", quant: "?", sizeGb: 0, hfRepo: "", kvMbPer1k: 0, tags: [] };
   useCluster.getState().setRun({ status: "ready", model: m, endpoint: "http://127.0.0.1:8080" });
   useCluster.getState().pushEngineLog("[argus] подключились к уже запущенному движку (держать модель загруженной)");

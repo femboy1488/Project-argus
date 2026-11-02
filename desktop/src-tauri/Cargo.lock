@@ -4896,11 +4896,12 @@ dependencies = [
 
 [[package]]
 name = "usb-cluster"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "enigo",
+ "flate2",
  "log",
  "reqwest 0.12.28",
  "serde",

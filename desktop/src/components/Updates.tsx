@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { Progress } from "./Meter";
 import { Download, ExternalLink, Info, Loader2, RefreshCw, Smartphone, X } from "lucide-react";
 import { useCluster } from "../store/cluster";
 import { checkUpdates, installUpdate, openExternal, setUpdateCheck, skipNodeUpdate, skipUpdateVersion, updateUsbNode } from "../lib/api";
@@ -20,13 +21,13 @@ function Shell({ title, icon, onClose, children, footer, width = 640 }: {
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="max-h-[85vh] flex flex-col border border-pl-line2 bg-pl-bg1 shadow-2xl" style={{ width }}>
+      <div className="flex max-h-[85vh] max-w-[calc(100vw-2rem)] flex-col border border-pl-line2 bg-pl-bg1 shadow-2xl" style={{ width }}>
         <div className="flex h-9 shrink-0 items-center justify-between border-b border-pl-line bg-pl-bg2 px-3">
-          <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.12em] text-pl-mute">{icon} {title}</span>
+          <span className="flex min-w-0 items-center gap-2 truncate text-xs font-semibold uppercase tracking-[0.12em] text-pl-mute">{icon} {title}</span>
           {onClose && <button onClick={onClose} className="text-pl-dim hover:text-pl-text"><X size={15} /></button>}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-4">{children}</div>
-        <div className="flex shrink-0 justify-end gap-2 border-t border-pl-line bg-pl-bg2 px-3 py-2">{footer}</div>
+        <div className="flex shrink-0 flex-wrap justify-end gap-2 border-t border-pl-line bg-pl-bg2 px-3 py-2">{footer}</div>
       </div>
     </div>
   );
@@ -88,9 +89,10 @@ export function UpdateDialog() {
       {p && p.phase && (
         <div className="mt-3">
           <div className="flex justify-between font-mono text-2xs text-pl-mute">
-            <span>{PHASE[p.phase] ?? p.phase}</span>{p.total > 0 && <span>{mb(p.done)} / {mb(p.total)} MB</span>}
+            <span>{PHASE[p.phase] ?? p.phase}</span>{p.total > 0 ? <span className="tabular-nums">{mb(Math.min(p.done, p.total))} / {mb(p.total)} MB</span> : p.done > 0 && <span className="tabular-nums">{mb(p.done)} MB</span>}
           </div>
-          <div className="mt-1 h-1.5 w-full bg-pl-bg3"><div className="h-full bg-pl-blue transition-all" style={{ width: `${p.total ? Math.min(100, (p.done / p.total) * 100) : p.phase === "download" ? 0 : 100}%` }} /></div>
+          {/* unknown size (no Content-Length) or a non-download phase → indeterminate instead of a bar frozen at 0% */}
+          <Progress className="mt-1" value={p.phase === "download" && p.total > 0 ? (p.done / p.total) * 100 : p.phase === "error" ? 100 : null} tone={p.phase === "error" ? "red" : "blue"} />
         </div>
       )}
       {err && <div className="mt-3 border-l-2 border-pl-red bg-pl-red/10 p-2 font-mono text-2xs text-pl-red">{err}</div>}

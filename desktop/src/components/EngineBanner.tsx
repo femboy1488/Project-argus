@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Loader2, RotateCw, TriangleAlert, Zap } from "lucide-react";
+import { Flame, Loader2, RotateCw, TriangleAlert, Zap } from "lucide-react";
 import { useCluster } from "../store/cluster";
 import { restartEngine } from "../lib/api";
 
@@ -11,7 +11,18 @@ export default function EngineBanner({ compact }: { compact?: boolean }) {
   if (!e) return null;
   const broken = e.status === "broken" || run.status === "broken";
   const hint = !broken && e.status === "ready" && e.newNodes;
-  if (!broken && !hint) return null;
+  const warming = !broken && e.status === "ready" && e.warming;
+  if (!broken && !hint && !warming) return null;
+  if (warming && !hint) return (
+    <div className={`flex items-center gap-3 border-l-2 border-pl-cyan bg-pl-cyan/10 px-3 py-2 text-xs ${compact ? "" : "mx-3 mt-3"}`}>
+      <Flame size={14} className="shrink-0 text-pl-cyan" />
+      <div className="min-w-0 flex-1 leading-5">
+        <span className="font-semibold text-pl-cyan">Прогрев…</span>{" "}
+        <span className="text-pl-text">Модель загружена и один раз прогоняет системный промпт чата — так первый ответ придёт быстрее. Писать уже можно.</span>
+      </div>
+      <Loader2 size={12} className="shrink-0 animate-spin text-pl-cyan" />
+    </div>
+  );
 
   async function restart() {
     setBusy(true);

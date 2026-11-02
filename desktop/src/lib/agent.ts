@@ -30,12 +30,16 @@ export const TOOLS: ToolDef[] = [
   { name: "mouse_move", dangerous: true, description: "Move the mouse to (x, y) in screenshot pixels.", parameters: obj({ x: num("x"), y: num("y") }, ["x", "y"]) },
   { name: "type_text", dangerous: true, description: "Type text with the keyboard into the focused window.", parameters: obj({ text: str("Text to type") }, ["text"]) },
   { name: "key_press", dangerous: true, description: "Press a key or combination, e.g. enter, ctrl+s, alt+tab, win+r.", parameters: obj({ keys: str("Key combination joined with +") }, ["keys"]) },
+  { name: "search_files", dangerous: false, description: "Search the user's own indexed documents (folder chosen in «Знания») by meaning. Returns the most relevant passages with file paths.", parameters: obj({ query: str("What to look for, in natural language"), k: num("How many passages, default 5") }, ["query"]) },
+  { name: "wiki_search", dangerous: false, description: "Search the offline library (Wikipedia and other Kiwix books). Returns article titles with paths for wiki_read.", parameters: obj({ query: str("Search words") }, ["query"]) },
+  { name: "wiki_read", dangerous: false, description: "Read an article from the offline library by the path returned by wiki_search (text, up to 8000 characters).", parameters: obj({ path: str("Article path, e.g. /content/wikipedia_ru_all/A/Москва") }, ["path"]) },
 ];
 
 export const TOOL_LABEL: Record<string, string> = {
   list_dir: "Список файлов", read_file: "Прочитать файл", open_url: "Открыть ссылку", screenshot: "Скриншот экрана",
   run_command: "Команда PowerShell", write_file: "Записать файл", open_app: "Открыть приложение",
   mouse_click: "Клик мышью", mouse_move: "Переместить мышь", type_text: "Ввести текст", key_press: "Нажать клавиши",
+  search_files: "Поиск по моим файлам", wiki_search: "Поиск в библиотеке", wiki_read: "Статья из библиотеки",
 };
 
 export const isDangerous = (name: string) => TOOLS.find((t) => t.name === name)?.dangerous ?? true;

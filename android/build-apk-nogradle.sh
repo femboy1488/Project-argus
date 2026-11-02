@@ -17,8 +17,8 @@ $AAPT2 link -o $B/base.apk -I $T/android.jar --manifest $B/AndroidManifest.xml -
 $T/kotlinc/bin/kotlinc $M/java/com/harkcluster/node/*.kt -no-stdlib -cp $T/android.jar:$T/kotlinc/lib/kotlin-stdlib.jar -jvm-target 17 -d $B/classes
 (cd $B/classes && jar cf ../classes.jar .)
 java -cp $T/r8.jar com.android.tools.r8.D8 --release --min-api 28 --lib $T/android.jar --output $B $B/classes.jar $T/kotlinc/lib/kotlin-stdlib.jar
-cp $M/jniLibs/arm64-v8a/*.so $B/lib/arm64-v8a/   # librpc_server{,_dotprod,_i8mm}.so
-(cd $B && cp base.apk u.apk && zip -q u.apk classes.dex && zip -q -0 u.apk lib/arm64-v8a/*.so && zipalign -f -p 4 u.apk a.apk)
+cp $M/jniLibs/arm64-v8a/*.so $B/lib/arm64-v8a/   # rpc_server{,_dotprod,_i8mm}, llama_server, whisper_server, kiwix_serve, argus_bench{,_dotprod}; deflated (manifest has extractNativeLibs=true)
+(cd $B && cp base.apk u.apk && zip -q u.apk classes.dex && zip -q -9 u.apk lib/arm64-v8a/*.so && zipalign -f -p 4 u.apk a.apk)
 apksigner sign --ks argus-debug.jks --ks-pass pass:argus123 --out Argus-Node.apk $B/a.apk
 echo "-> Argus-Node.apk"
 

@@ -405,6 +405,20 @@ async fn serve(mut s: TcpStream, st: &AppState) -> Result<()> {
             s.shutdown().await.ok();
             Ok(())
         }
+        // 0.3.2 «Помощник»: the helper model, downloaded once on the PC (helper.rs), for USB (adb reverse) and Wi-Fi nodes
+        p if p.starts_with("/helper/") => {
+            let name = &p["/helper/".len()..];
+            let file = crate::helper::helpers_dir().join(name);
+            if !crate::helper::safe_file(name) || !file.is_file() {
+                return reply(&mut s, "404 Not Found", "text/plain", b"no such helper model", head_only).await;
+            }
+            let mut f = tokio::fs::File::open(&file).await?;
+            let len = f.metadata().await?.len();
+            s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            if !head_only { tokio::io::copy(&mut f, &mut s).await?; }
+            s.shutdown().await.ok();
+            Ok(())
+        }
         _ => reply(&mut s, "404 Not Found", "text/plain", b"not found", head_only).await,
     }
 }

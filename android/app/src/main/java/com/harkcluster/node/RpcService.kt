@@ -152,6 +152,12 @@ class RpcService : Service() {
         val line = "$VERSION_TAG ${v.versionName} (${v.longVersionCode})"
         Log.i(TAG, line); addLog(line)
 
+        // 0.3.2 «Помощник» (helper.rs): handled before the idempotent early return below, which would otherwise
+        // swallow a helper command sent to an already running node. rpc-server handling continues unchanged.
+        // 0.3.3: unified role protocol (role / role_stop / helper_* / voice_* / zim) + relaunch of persisted roles
+        Roles.handleExtras(this, intent, wantWifi)
+        Bench.ensure(this)
+
         val wantPort = if (wantWifi) WIFI_PORT else (intent?.getIntExtra("port", WIFI_PORT) ?: WIFI_PORT)
         bigCores = detectBigCores()
         // -t = big cores (little cores slow every matmul down to their pace). The PC's "threads" extra is
@@ -181,6 +187,27 @@ class RpcService : Service() {
         }
         supervisor = thread(name = "rpc-supervisor") { supervise() }
         return START_STICKY
+    }
+
+    /** `dumpsys activity service com.harkcluster.node/.RpcService` — the PC reads the `argus-helper` line (helper.rs). */
+    override fun dump(fd: java.io.FileDescriptor?, writer: java.io.PrintWriter, args: Array<out String>?) {
+        writer.println(Helper.dumpLine())
+        writer.println("argus-status " + statusJson())   // 0.3.3: one-line JSON (telemetry + roles), see docs/ROLES.md
+        writer.println("argus-rpc state=$state mode=${if (wifi) "wifi" else "usb"} port=$port threads=$threads variant=$variant clients=$clients restarts=$restarts")
+        writer.println("argus-bench gbps=${Bench.cached(this)?.let { "%.2f".format(Locale.US, it) } ?: "-"} threads=${Bench.threads} running=${Bench.running}")
+        writer.flush()
+    }
+
+    /** `argus-status` payload: version, telemetry, rpc and the roles map. */
+    private fun statusJson(): String {
+        val (vn, vc) = Updater.myVersion(this)
+        val j = JSONObject().put("argus", "status").put("v", 1).put("vn", vn).put("vc", vc)
+        Telemetry.put(this, j)
+        wifiIp?.let { j.put("wifi_ip", it) }
+        j.put("rpc", JSONObject().put("state", state.name.lowercase()).put("port", port).put("threads", threads)
+            .put("big_cores", bigCores).put("variant", variant).put("mode", if (wifi) "wifi" else "usb"))
+        j.put("roles", Roles.json())
+        return j.toString()
     }
 
     private fun supervisorAlive() = supervisor?.isAlive == true && !stopping
@@ -234,6 +261,10 @@ class RpcService : Service() {
                     .put("argus", "node").put("v", 1).put("name", Build.MODEL).put("port", port)
                     .put("ram_mb", m.totalMem shr 20).put("free_mb", m.availMem shr 20).put("variant", variant)
                     .put("vn", myVn).put("vc", myVc)          // 0.3.1: app version for «Нода устарела» on the PC
+                    .put("helper", Helper.beaconJson())       // 0.3.2: «Помощник» status (beacon.rs BeaconHelper)
+                    .apply { Bench.cached(this@RpcService)?.let { put("bench", Math.round(it * 100.0) / 100.0) } }   // 0.3.2: autobench GB/s
+                    .let { Telemetry.put(this@RpcService, it) }   // 0.3.3: temp_c, throttled, battery_pct, charging, usb_net_ip
+                    .put("roles", Roles.json())                      // 0.3.3: {helper,voice,library:{state,port,...}}
                     .toString().toByteArray()
                 val targets = linkedSetOf<InetAddress>(InetAddress.getByName("255.255.255.255"))
                 (lan?.second ?: dhcpBroadcast())?.let { targets.add(it) }
@@ -255,6 +286,7 @@ class RpcService : Service() {
                     val ip = pkt.address?.hostAddress ?: continue
                     if (Updater.pcHost != ip) addLog("PC found: $ip (update port ${msg.optInt("update_port", 50055)}, node_vc ${msg.optLong("node_vc")})")
                     Updater.onHostMessage(applicationContext, ip, msg)
+                    Roles.onHostReply(applicationContext, ip, msg)    // helper/voice/library: {...} run / false stop / absent keep
                 }
             }
         } catch (_: InterruptedException) {
@@ -370,6 +402,7 @@ class RpcService : Service() {
         supervisor?.interrupt(); supervisor = null
         state = State.OFF
         stopWifiExtras()
+        Helper.stop("node stopped"); Voice.stop("node stopped"); Library.stop("node stopped")   // assignments stay persisted
         wakeLock?.takeIf { it.isHeld }?.release()
         addLog("node stopped")
         super.onDestroy()

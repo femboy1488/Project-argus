@@ -21,6 +21,20 @@ pub struct Discovered {
     /// Argus Node versionName / versionCode (beacon "vn"/"vc", node 0.3.1+)
     pub vn: Option<String>,
     pub vc: Option<u64>,
+    /// 0.3.2: autobench result of the node app (GB/s), and its «Помощник» status
+    pub bench: Option<f32>,
+    pub helper: Option<BeaconHelper>,
+    /// optional thermal state (node 0.3.3+): °C and throttling flag
+    pub temp_c: Option<f32>,
+    pub throttled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BeaconHelper {
+    #[serde(default)] pub state: String,
+    #[serde(default)] pub model: Option<String>,
+    #[serde(default)] pub pct: Option<u32>,
+    #[serde(default)] pub error: Option<String>,
 }
 impl Discovered {
     pub fn endpoint(&self) -> String { format!("{}:{}", self.host, self.port) }
@@ -38,6 +52,10 @@ struct Beacon {
     #[serde(default)] variant: Option<String>,
     #[serde(default)] vn: Option<String>,
     #[serde(default)] vc: Option<u64>,
+    #[serde(default)] bench: Option<f32>,
+    #[serde(default)] helper: Option<BeaconHelper>,
+    #[serde(default)] temp_c: Option<f32>,
+    #[serde(default)] throttled: Option<bool>,
 }
 
 /// {"argus":"node","v":1,"name":"<model>","port":50052,"ram_mb":N,"free_mb":N,"variant":"dotprod","vn":"0.3.1","vc":5}
@@ -53,13 +71,19 @@ pub fn parse_beacon(bytes: &[u8], src: IpAddr) -> Option<Discovered> {
         ram_mb: b.ram_mb.unwrap_or(0), free_mb: b.free_mb.unwrap_or(0),
         variant: b.variant.map(|v| v.chars().take(24).collect()), last_seen: Instant::now(),
         src_port: 0, vn: b.vn.map(|v| v.chars().filter(|c| !c.is_control()).take(24).collect()), vc: b.vc,
+        bench: b.bench.filter(|g| g.is_finite() && *g > 0.0 && *g < 1000.0),
+        temp_c: b.temp_c.filter(|t| t.is_finite() && *t > -40.0 && *t < 150.0), throttled: b.throttled,
+        helper: b.helper.map(|mut h| { h.error = h.error.map(|e| e.chars().filter(|c| !c.is_control()).take(200).collect()); h }),
     })
 }
 
 /// Unicast reply to a node beacon: where to fetch node.apk and which versionCode this PC bundles.
-pub fn host_reply(update_port: u16, node_vc: Option<u64>, force_update: bool) -> Vec<u8> {
+/// 0.3.2: `helper` = what the node should run as «Помощник» ({"file","path","size","port"}), `false` = stop,
+/// `null` = no change (model not on the PC yet).
+pub fn host_reply(update_port: u16, node_vc: Option<u64>, force_update: bool, helper: Option<serde_json::Value>) -> Vec<u8> {
     let mut j = serde_json::json!({ "argus": "host", "v": 1, "update_port": update_port, "node_vc": node_vc.unwrap_or(0) });
     if force_update { j["update"] = serde_json::Value::Bool(true); }
+    if let Some(h) = helper.filter(|h| !h.is_null()) { j["helper"] = h; }
     j.to_string().into_bytes()
 }
 
@@ -83,7 +107,12 @@ mod tests {
         assert_eq!(d.vc, None);
         let d = parse_beacon(br#"{"argus":"node","v":1,"vn":"0.3.1","vc":5}"#, ip).unwrap();
         assert_eq!((d.vn.as_deref(), d.vc), (Some("0.3.1"), Some(5)));
-        let r: serde_json::Value = serde_json::from_slice(&host_reply(50055, Some(5), false)).unwrap();
+        let r: serde_json::Value = serde_json::from_slice(&host_reply(50055, Some(5), false, None)).unwrap();
         assert_eq!((r["argus"].as_str(), r["node_vc"].as_u64(), r.get("update").is_none()), (Some("host"), Some(5), true));
+        let d = parse_beacon(br#"{"argus":"node","v":1,"bench":12.5,"helper":{"state":"downloading","pct":40,"model":"x.gguf"}}"#, ip).unwrap();
+        assert_eq!(d.bench, Some(12.5));
+        assert_eq!(d.helper.as_ref().map(|h| (h.state.as_str(), h.pct)), Some(("downloading", Some(40))));
+        let r: serde_json::Value = serde_json::from_slice(&host_reply(50055, Some(6), false, Some(serde_json::Value::Bool(false)))).unwrap();
+        assert_eq!(r["helper"], serde_json::Value::Bool(false));
     }
 }

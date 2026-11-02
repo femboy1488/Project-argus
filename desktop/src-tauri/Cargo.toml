@@ -1,6 +1,6 @@
 [package]
 name = "usb-cluster"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2021"
 
 [build-dependencies]
@@ -17,6 +17,8 @@ log = "0.4"
 # 0.3.1 self-update: GitHub releases (rustls + ring, no OpenSSL / no system TLS), SHA-256 verification
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.10"
+# «Знания»/«Очередь»: .docx is a ZIP (deflate), PDF streams are zlib
+flate2 = "1"
 
 # Agent mode: screenshot + mouse/keyboard (Windows only; stubs elsewhere)
 [target.'cfg(windows)'.dependencies]

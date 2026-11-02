@@ -48,7 +48,7 @@ export default function UsbWizard() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="w-[600px] border border-pl-line2 bg-pl-bg1 shadow-2xl">
+      <div className="max-h-[92vh] w-[600px] max-w-[calc(100vw-2rem)] overflow-y-auto border border-pl-line2 bg-pl-bg1 shadow-2xl">
         <div className="flex h-9 items-center justify-between border-b border-pl-line bg-pl-bg2 px-3">
           <span className="text-xs font-semibold uppercase tracking-[0.12em] text-pl-mute">Add node · USB</span>
           <button onClick={() => setWizard(false)} className="text-pl-dim hover:text-pl-text"><X size={15} /></button>

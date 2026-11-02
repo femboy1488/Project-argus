@@ -4,7 +4,7 @@ import { useCluster, type View } from "../store/cluster";
 interface Step { view: View; target?: string; title: string; body: string }
 
 const STEPS: Step[] = [
-  { view: "devices", target: "usb", title: "1 · Подключите планшет или телефон",
+  { view: "devices", target: "usb", title: "1 · Подключите телефон",
     body: "На устройстве: Настройки → О телефоне → 7 раз нажмите «Номер сборки» → Для разработчиков → включите «Отладка по USB». Подключите кабель и нажмите «Разрешить» на экране устройства. Argus сам установит ноду и добавит её память в пул." },
   { view: "devices", target: "lan", title: "2 · Ноутбук или Raspberry Pi по сети",
     body: "Есть ещё компьютер? Запустите на нём rpc-server из llama.cpp b12008 и добавьте его кнопкой «Добавить ноду по IP». Только для закрытой домашней сети." },
@@ -31,7 +31,9 @@ export default function Tour() {
     let raf = 0;
     const find = () => {
       const el = step.target ? document.querySelector(`[data-tour="${step.target}"]`) : null;
-      setRect(el ? el.getBoundingClientRect() : null);
+      const r = el ? el.getBoundingClientRect() : null;
+      // follow the target (scrolling / resizing) but only re-render when it actually moved
+      setRect((p) => (p && r && p.x === r.x && p.y === r.y && p.width === r.width && p.height === r.height) || (!p && !r) ? p : r);
       raf = requestAnimationFrame(find);
     };
     const t = setTimeout(find, 60);
@@ -42,11 +44,12 @@ export default function Tour() {
     window.addEventListener("keydown", k); return () => window.removeEventListener("keydown", k);
   }, [setTour]);
 
-  const W = 360, pad = 8;
+  const W = Math.min(360, window.innerWidth - 24), pad = 8, CARD_H = 250;
   let left = window.innerWidth / 2 - W / 2, top = window.innerHeight / 2 - 100;
   if (rect) {
     left = Math.min(window.innerWidth - W - 12, Math.max(12, rect.left + rect.width / 2 - W / 2));
-    top = rect.bottom + 14 + 210 < window.innerHeight ? rect.bottom + 14 : Math.max(12, rect.top - 14 - 210);
+    top = rect.bottom + 14 + CARD_H < window.innerHeight ? rect.bottom + 14 : Math.max(12, rect.top - 14 - CARD_H);
+    top = Math.min(top, Math.max(12, window.innerHeight - CARD_H - 12));
   }
   return (
     <div className="fixed inset-0 z-[60]">

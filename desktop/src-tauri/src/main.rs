@@ -5,12 +5,24 @@ mod agent;
 mod beacon;
 mod cluster;
 mod gpu;
+mod helper;
 mod lan;
 mod llama;
 mod settings;
 mod split;
+mod queue;
+mod textx;
+mod rag;
+mod kiwix;
 mod state;
 mod updater;
+mod features;
+mod webchat;
+mod telegram;
+mod voice;
+mod vision;
+mod nodesvc;
+mod roles_extra;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -36,11 +48,28 @@ fn main() {
             let state = Arc::new(state::AppState::new(adb::Adb::new(adb_bin), apk, node_version, llama_bin, config));
             app.manage(state.clone());
             updater::start(app.handle().clone(), state.clone());   // asks the user; never installs by itself
+            features::start(state.clone());                       // argus-features.json + web chat :50080 + Telegram
             updater::start_node_server(state.clone());             // node.apk for Wi-Fi nodes on :50055
+            tauri::async_runtime::spawn(nodesvc::run(state.clone()));   // embeddings/whisper/kiwix forwards on USB phones
+            tauri::async_runtime::spawn(roles_extra::run(state.clone())); // «Голос» / «Библиотека» assignments (0.3.3 nodes)
+            queue::init(app.handle().clone(), state.clone());     // «Ночная очередь»
             tauri::async_runtime::spawn(cluster::start(app.handle().clone(), state));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            queue::queue_list,
+            queue::queue_add,
+            queue::queue_remove,
+            queue::queue_start,
+            queue::queue_pause,
+            rag::rag_index,
+            rag::rag_status,
+            rag::rag_search,
+            kiwix::kiwix_info,
+            kiwix::kiwix_set_url,
+            kiwix::kiwix_books,
+            kiwix::kiwix_search,
+            kiwix::kiwix_read,
             cluster::get_snapshot,
             cluster::rescan,
             cluster::reconnect_node,
@@ -65,6 +94,19 @@ fn main() {
             lan::set_node_weight,
             lan::set_node_enabled,
             lan::set_fast_start,
+            cluster::rebench_node,
+            llama::plan_split,
+            llama::save_chat_session,
+            llama::restore_chat_session,
+            llama::set_draft_enabled,
+            llama::get_draft_status,
+            cluster::export_bench_results,
+            helper::helper_chat,
+            helper::helper_cancel,
+            helper::set_node_role,
+            helper::set_roles_enabled,
+            helper::set_helper_model,
+            helper::retry_helper,
             agent::platform_info,
             agent::agent_run_command,
             agent::agent_read_file,
@@ -75,12 +117,21 @@ fn main() {
             agent::agent_type_text,
             agent::agent_key_press,
             agent::open_external,
+            features::features_get,
+            features::features_set,
+            features::route_target,
+            voice::transcribe,
+            nodesvc::nodesvc_list,
+            roles_extra::node_roles_get,
+            roles_extra::set_node_voice,
+            roles_extra::set_node_library,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
+            rag::shutdown();
             // stop llama-server unless "keep model loaded" is on (no orphan engines holding :8080 / rpc slots)
             if let Some(st) = handle.try_state::<Arc<state::AppState>>() {
                 let st = st.inner().clone();

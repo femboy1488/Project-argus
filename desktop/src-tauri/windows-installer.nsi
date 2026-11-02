@@ -5,7 +5,7 @@ Unicode true
 
 ; Paths: defaults = the sandbox build; CI passes /DAPP_EXE=... /DRES_DIR=... /DOUT_FILE=... /DICON=... /DVC_REDIST=...
 !ifndef VERSION
-  !define VERSION "0.3.1"
+  !define VERSION "0.3.3"
 !endif
 !ifndef APP_EXE
   !define APP_EXE "/workspace/tools/target/x86_64-pc-windows-msvc/release/usb-cluster.exe"

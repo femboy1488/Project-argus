@@ -1,4 +1,4 @@
-# Argus 0.3.1 — pool PC GPUs + Android RAM + LAN/Wi-Fi machines for local LLMs (Windows + Linux)
+# Argus 0.3.2 — pool PC GPUs + Android RAM + LAN/Wi-Fi machines for local LLMs (Windows + Linux)
 
 UI: Palantir Blueprint-style dark ops console (topology graph, object inspector, dense data tables).
 
@@ -9,7 +9,8 @@ UI: Palantir Blueprint-style dark ops console (topology graph, object inspector,
 │        │                       ├─ adb.rs      adb CLI wrapper (timeouts)   │
 │        │ SSE /v1/chat          ├─ gpu.rs      --list-devices/nvidia-smi/vk │
 │        │ tools (agent)         ├─ lan.rs      LAN rpc + UDP beacons :50053 │
-│        │                       ├─ split.rs    --device / -ts planning      │
+│        │                       ├─ split.rs    speed-aware -ts, roles       │
+│        │                       ├─ helper.rs   «Помощник» llama-server :50062│
 │        │                       ├─ agent.rs    PC tools (cmd/files/screen)  │
 │        ▼                       └─ llama.rs    llama-server + supervisor    │
 │  llama-server :8080  (Vulkan, --rpc …, --device RPC0..,Vulkan0.., -ts …)  │
@@ -20,6 +21,56 @@ UI: Palantir Blueprint-style dark ops console (topology graph, object inspector,
 │   rpc-server -H 127.0.0.1 -p 50052 -t <big> -c                            │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+## What's new in 0.3.2 — speed-aware split, warm-up, experiment «Роли»
+
+### Node autobench (`cluster.rs` `autobench`, `rebench_node`)
+- On first sync of a USB node (once per device serial + node version, cached in settings `bench`), Argus pushes
+  `resources/argus-bench-a64` (or `argus-bench-a64-dotprod` when the CPU has `asimddp`) to `/data/local/tmp/argus-bench`
+  and runs `argus-bench -s 1.5`. Output line `{"argus":"bench","v":1,"gbps":…,"threads":…}` → `benchGbps`
+  (GB/s of int8 weights the node can process). The same bench ships inside the node APK as `libargus_bench{,_dotprod}.so`.
+- Wi-Fi Android nodes run the bench in the app and report `bench` (GB/s) in their UDP beacon (beacon.rs).
+- Round-trip time per node (`rttMs`) is measured too. UI «Повторить тест скорости» = `rebench_node(id)` (forces a re-run).
+- `speed` = bench (or an estimate for GPUs / un-benched nodes, `speedMeasured=false`) × the user's weight slider.
+
+### Split by speed (`split.rs`, `plan_split`)
+- A token passes every device in turn (pipeline), so time per token = Σ (device time for its layers) + network hops.
+  That sum is minimal when the fastest device is filled first (up to its usable memory), then the next fastest, etc.
+- Node roles (settings, `set_node_role`): `auto` (default), `model` (always in the split), `free` (never used),
+  `helper` (experiment only; acts as `auto` while «Роли» is off).
+- Minimal set: GPUs + `model` nodes, then the fastest `auto` nodes until model + context (`needMb`) fit.
+  Online `auto` nodes left out become **«Свободна»** (`freeNodes`): no `--rpc` endpoint, no load, no heat.
+- `-ts` shares: fastest first up to each device's memory; a forced node keeps a small minimum share.
+- `estTps` — rough tok/s estimate from the same numbers, shown as «≈N ток/с» in the UI and the engine log.
+- Unknown model size: every `auto`/`model` node is used, share ∝ speed, capped by memory.
+
+### Warm-up (`llama.rs` `warmup`)
+- `StartModelArgs.warmupSystem` = system prompt of the current chat. Right after `/health` turns OK the engine is
+  `warming` («Прогрев…»): the prompt is processed once (prompt cache), so the first real answer skips that prefill.
+
+### Experiment «Роли»: the «Помощник» role (`helper.rs`, UI `ParallelTest.tsx`, `lib/helpers.ts`)
+- Off by default (`set_roles_enabled`). A node with role `helper` runs its **own** `llama-server` (static aarch64 build
+  in the APK as `libllama_server.so`) with a small model next to the main model; it is never part of the split.
+- Models (`set_helper_model`): Qwen3 0.6B Q4_0 (default), Qwen3 1.7B Q4_0, Qwen3 4B Instruct 2507 Q4_0, or a custom
+  `owner/repo/File.gguf`. Q4_0 because llama.cpp repacks it for arm64 dotprod/i8mm at load.
+- Flow (`tick` every 3 s while the experiment is on): the model is downloaded once on the PC
+  (`<models>/helpers/<file>`) → served on **:50055** `/helper/<file>` (updater.rs). USB nodes fetch it through
+  `adb reverse tcp:50055`; Wi-Fi nodes from the PC's LAN address.
+- **Ports:** on the node llama-server listens on **50062** (`HELPER_PORT`). USB: PC side
+  `adb forward tcp:5016N tcp:50062`, N from **50162** up (`FIRST_FWD_PORT`). Wi-Fi: `http://<node ip>:50062`.
+  The rpc-server keeps 50052 / PC 50052+ as before.
+- USB start: `am start-foreground-service … --es helper_model <file> --es helper_url http://127.0.0.1:50055/helper/<file>`;
+  stop: `--ez helper_stop true`. Status comes back in `dumpsys activity service …/.RpcService` (line `argus-helper …`).
+  Wi-Fi: assignment in the unicast beacon reply (lan.rs), status in the beacon. Ready = `GET /health` → 200.
+- Uses: `helper_chat` (least-busy ready helper or a given node; streaming via `helper-stream` events, `helper_cancel`)
+  for auto chat titles after the first answer, «Сводка» (summary of the chat, not added to history; falls back to the
+  main model when no helper is ready), and «Параллельный тест» (one prompt to the main model and every ready helper).
+- Nothing here installs or updates an app.
+
+### Updates
+- Unchanged rule: nothing installs without the user's click. Node 0.3.2 (versionCode 6) is offered over USB
+  («Обновить ноду на …?») and over Wi-Fi (:50055). The APK stores native libs deflated (`extractNativeLibs=true`),
+  ≈11 MB instead of ≈24 MB.
 
 ## What's new in 0.3.1 — self-update (always asks)
 
@@ -167,7 +218,7 @@ aarch64: our static musl builds from `android/app/src/main/jniLibs/arm64-v8a` (i
 
 1. **PC:** run `Argus-Setup.exe` (bundles llama-server b12008 Vulkan, ADB, node.apk — no other installs).
    Linux: AppImage / .deb from CI (Vulkan driver + Android udev rules needed).
-2. **Tablet/phone:** Settings → About → tap *Build number* 7× → Developer options → **USB debugging ON**.
+2. **Phone:** Settings → About → tap *Build number* 7× → Developer options → **USB debugging ON**.
    (`Argus-Node.apk` is installed automatically over USB; sideload it manually only if you want.)
 3. Plug in USB, accept the RSA prompt. Argus installs the node, starts rpc-server, forwards the port → node goes ONLINE.
 4. **Models** → pick context (8K chat / 64K agents) → Deploy. Weights download once from Hugging Face.
@@ -194,7 +245,7 @@ model:
   api_key: argus
 ```
 Hermes requires ≥64K context: deploy with the 64K preset. 64K of KV cache costs ~4–5 GB, so on GTX 960 4GB + one
-8GB tablet only ~3B models are borderline; add a second device for Qwen3 4B / 8B agents. Plain chat apps are fine at 8–32K.
+8GB phone only ~3B models are borderline; add a second device for Qwen3 4B / 8B agents. Plain chat apps are fine at 8–32K.
 
 ## Plug-and-play sequence (cluster.rs)
 1. `adb devices -l` every 1.5 s. `unauthorized` → UI asks the user to tap *Allow*.
@@ -222,7 +273,7 @@ Hermes requires ≥64K context: deploy with the 64K preset. 64K of KV cache cost
 ## Honest performance notes
 - Weights are pushed over USB at load time. Through adb, expect roughly 20–40 MB/s on USB 2.0, so a few GB of layers takes minutes the first time; `rpc-server -c` caches them on the device for next time.
 - Per token, only activations cross the cable (small), but each hop adds latency, and a phone CPU computes its layers much slower than a GPU. Pooling makes models *fit* that otherwise wouldn't; it won't make small models faster.
-- Example: GTX 960 4 GB + 8 GB tablet → 12 GB raw, ~7 GB usable → Llama 3.1 8B / Gemma 2 9B Q4 fit; Mistral Nemo 12B is tight.
+- Example: GTX 960 4 GB + 8 GB phone → 12 GB raw, ~7 GB usable → Llama 3.1 8B / Gemma 2 9B Q4 fit; Mistral Nemo 12B is tight.
 
 ## Prebuilt in this repo
 - `android/app/src/main/jniLibs/arm64-v8a/librpc_server.so`: ggml-rpc-server from llama.cpp **b12008** (344846b). Static aarch64 (musl, zig cc, armv8-a baseline, so it runs on any arm64 Android), 2.3 MB, smoke-tested. Run it straight from adb if you want to skip the APK:
@@ -268,9 +319,9 @@ desktop/
                        launch.ts (deploy + applyEngine: UI ⇄ Rust supervisor),
                        models.ts (curated list, fit, best pick, drafts), types.ts
     store/cluster.ts   zustand store (conversations, speed settings)
-  src-tauri/src/       main.rs, state.rs, settings.rs, adb.rs, cluster.rs, gpu.rs, lan.rs, beacon.rs, split.rs, llama.rs, agent.rs,
+  src-tauri/src/       main.rs, state.rs, settings.rs, adb.rs, cluster.rs, gpu.rs, lan.rs, beacon.rs, split.rs, llama.rs, agent.rs, helper.rs,
                        updater.rs (GitHub self-update + node.apk HTTP :50055)
-  src-tauri/resources/ adb, llama-server + ggml dlls (Vulkan), node.apk, node.version (bundled)
+  src-tauri/resources/ adb, llama-server + ggml dlls (Vulkan), node.apk, node.version, argus-bench-a64{,-dotprod} (bundled)
 scripts/argus-node-linux.sh                rpc-server b12008 + UDP beacon for Linux PCs / Raspberry Pi
 scripts/make-release-assets.sh             SHA256SUMS.txt for a manual GitHub Release
 android/
@@ -280,7 +331,6 @@ android/
 
 ## Next steps
 - Verify with real devices; tune the 70% (USB) / 80% (LAN) headroom and default speed weights.
-- Real per-node micro-benchmark to set speed weights automatically (today: manual slider).
 - Auth/encryption for LAN RPC would need an upstream rpc-server change (or a TLS/WireGuard tunnel).
 - Agent screenshots/mouse on Linux (xcap needs pipewire/wayland dev libs in CI).
 - Hot-adding a node to a running engine is impossible in llama.cpp; Argus offers «Перезапустить движок» instead.
@@ -289,4 +339,4 @@ android/
 
 ---
 
-💀 Проект делается на GTX 960 и планшете. [Поддержать на Boosty](SUPPORT.md)
+💀 Проект делается на GTX 960 и старых телефонах. [Поддержать на Boosty](SUPPORT.md)

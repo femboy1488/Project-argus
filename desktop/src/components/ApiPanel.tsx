@@ -48,10 +48,10 @@ print(r.choices[0].message.content)
   ];
 
   return (
-    <div className="grid h-full grid-cols-[1fr_320px] gap-px bg-pl-line">
-      <div className="flex min-w-0 flex-col gap-3 overflow-y-auto bg-pl-bg0 p-3">
+    <div className="grid h-full grid-cols-1 content-start gap-px overflow-y-auto bg-pl-line xl:grid-cols-[minmax(0,1fr)_320px] xl:content-stretch xl:overflow-hidden">
+      <div className="flex min-w-0 flex-col gap-3 bg-pl-bg0 p-3 xl:overflow-y-auto">
         <div className="panel" data-tour="api">
-          <div className="panel-head"><span>OpenAI-compatible endpoint</span><Health live={live} /></div>
+          <div className="panel-head gap-2"><span className="truncate">OpenAI-compatible endpoint</span><Health live={live} /></div>
           <div className="grid grid-cols-3 divide-x divide-pl-line">
             <Field k="Base URL" v={base} />
             <Field k="Model ID" v={model} />
@@ -63,10 +63,10 @@ print(r.choices[0].message.content)
         </div>
 
         <div className="panel min-h-0">
-          <div className="flex border-b border-pl-line bg-pl-bg2">
+          <div className="flex overflow-x-auto border-b border-pl-line bg-pl-bg2">
             {clients.map((c, i) => (
               <button key={c.name} onClick={() => setTab(i)}
-                className={clsx("relative h-8 px-3 text-xs", tab === i ? "text-pl-text" : "text-pl-dim hover:text-pl-mute")}>
+                className={clsx("relative h-8 shrink-0 whitespace-nowrap px-3 text-xs", tab === i ? "text-pl-text" : "text-pl-dim hover:text-pl-mute")}>
                 {c.name}{tab === i && <span className="absolute inset-x-0 bottom-0 h-0.5 bg-pl-blue" />}
               </button>
             ))}
@@ -75,7 +75,7 @@ print(r.choices[0].message.content)
         </div>
       </div>
 
-      <aside className="flex flex-col bg-pl-bg1">
+      <aside className="flex flex-col bg-pl-bg1 max-xl:border-t max-xl:border-pl-line">
         <div className="panel-head"><span>Access policy</span></div>
         <label className="flex cursor-pointer items-center justify-between border-b border-pl-line px-4 py-3 text-xs">
           <span>
@@ -106,13 +106,13 @@ function Health({ live }: { live: boolean }) {
     return () => { stop = true; clearInterval(t); };
   }, [live]);
   const [t, c] = ok ? ["SERVING", "border-pl-green/50 text-pl-green"] : live ? ["CHECKING", "border-pl-orange/50 text-pl-orange"] : ["OFFLINE", "border-pl-line2 text-pl-dim"];
-  return <span className={clsx("tag border normal-case tracking-normal", c)}>● {t}</span>;
+  return <span className={clsx("tag shrink-0 border normal-case tracking-normal", c)}>● {t}</span>;
 }
 
 function Field({ k, v }: { k: string; v: string }) {
   return (
-    <div className="flex items-center justify-between gap-2 px-4 py-3">
-      <div className="min-w-0"><div className="label">{k}</div><div className="mt-1 truncate font-mono text-sm text-pl-text">{v}</div></div>
+    <div className="flex min-w-0 items-center justify-between gap-2 px-3 py-3 xl:px-4">
+      <div className="min-w-0"><div className="label">{k}</div><div className="mt-1 truncate font-mono text-sm text-pl-text" title={v}>{v}</div></div>
       <CopyBtn text={v} />
     </div>
   );
@@ -122,7 +122,7 @@ function Snippet({ title, body }: { title: string; body: string }) {
   return (
     <div>
       <div className="flex items-center justify-between border-b border-pl-line px-4 py-1.5">
-        <span className="font-mono text-2xs text-pl-dim">{title}</span><CopyBtn text={body} />
+        <span className="min-w-0 truncate font-mono text-2xs text-pl-dim" title={title}>{title}</span><CopyBtn text={body} />
       </div>
       <pre className="overflow-x-auto bg-pl-bg0 p-4 font-mono text-xs leading-5 text-pl-text">{body}</pre>
     </div>

@@ -111,7 +111,9 @@ pub fn start_beacon_listener(app: AppHandle, st: Arc<AppState>) {
                         let Some(mut d) = parse_beacon(&buf[..n], src.ip()) else { continue };
                         d.src_port = src.port();
                         if reply_due(&d.host) {
-                            let msg = host_reply(crate::updater::NODE_UPDATE_PORT, crate::cluster::bundled_code(&st.bundled_node_version), false);
+                            let helper = crate::helper::lan_assignment(&st, &d.id()).await;
+                            let msg = host_reply(crate::updater::NODE_UPDATE_PORT, crate::cluster::bundled_code(&st.bundled_node_version), false, Some(helper));
+                            let msg = crate::roles_extra::extend_lan_reply(msg, &d.id());
                             if let Err(e) = sock.send_to(&msg, src).await { log::debug!("beacon reply {src}: {e}"); }
                         }
                         on_beacon(&app, &st, d).await;
@@ -152,6 +154,7 @@ async fn on_beacon(app: &AppHandle, st: &Arc<AppState>, d: Discovered) {
     if let Some(n) = st.nodes.lock().await.get_mut(&id) {
         n.beacon = true;
         n.variant = d.variant.clone();
+        if d.bench.is_some() { n.bench_gbps = d.bench; }
         apply_app_version(n, &d, &st.bundled_node_version);
         if n.stage == NodeStage::Connected && d.free_mb > 0 { n.available_mb = d.free_mb; }
     }
@@ -172,7 +175,7 @@ fn fail_counts() -> &'static std::sync::Mutex<HashMap<String, u32>> {
     F.get_or_init(Default::default)
 }
 
-enum Check { Online { info: Option<RpcInfo> }, Down(String), Fatal(String) }
+enum Check { Online { info: Option<RpcInfo>, rtt: Option<f32> }, Down(String), Fatal(String) }
 
 /// Health loop body (every 2 s): all LAN nodes concurrently.
 /// * a node the running engine is attached to only gets a TCP connect (rpc-server serves ONE client);
@@ -207,11 +210,13 @@ pub async fn refresh(st: &Arc<AppState>) {
             if tracked && beacon.as_ref().map(|b| b.last_seen.elapsed() > BEACON_LOST).unwrap_or(false) {
                 return (id, beacon, Check::Fatal("Wi-Fi маяк пропал (> 10 с): нода выключена или вне сети".into()));
             }
+            let t0 = std::time::Instant::now();
             let r = if is_attached {
-                if tcp_alive(&ep).await { Check::Online { info: None } } else { Check::Down("нет TCP-ответа".into()) }
+                if tcp_alive(&ep).await { Check::Online { info: None, rtt: None } } else { Check::Down("нет TCP-ответа".into()) }
             } else {
                 match rpc_query(&ep).await {
-                    Ok(info) if !info.mem.is_empty() => Check::Online { info: Some(info) },
+                    // HELLO + DEVICE_COUNT + GET_DEVICE_MEMORY (+ connect) ≈ 4 round trips
+                    Ok(info) if !info.mem.is_empty() => Check::Online { rtt: Some(t0.elapsed().as_secs_f32() * 1000.0 / (3 + info.mem.len()) as f32), info: Some(info) },
                     Ok(_) => Check::Fatal("rpc-server не сообщил ни одного устройства".into()),
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -233,9 +238,14 @@ pub async fn refresh(st: &Arc<AppState>) {
         let mut nodes = st.nodes.lock().await;
         let Some(n) = nodes.get_mut(&id) else { continue };
         n.beacon = beacon.is_some();
-        if let Some(b) = &beacon { n.variant = b.variant.clone(); apply_app_version(n, b, &st.bundled_node_version); }
+        if let Some(b) = &beacon {
+            n.variant = b.variant.clone();
+            if b.bench.is_some() { n.bench_gbps = b.bench; }
+            apply_app_version(n, b, &st.bundled_node_version);
+        }
         match check {
-            Check::Online { info: Some(info) } => {
+            Check::Online { info: Some(info), rtt } => {
+                if let Some(r) = rtt { n.rtt_ms = Some(match n.rtt_ms { Some(old) => old * 0.7 + r * 0.3, None => r }); }
                 let free: u64 = info.mem.iter().map(|m| m.0).sum::<u64>() / 1024 / 1024;
                 let total: u64 = info.mem.iter().map(|m| m.1).sum::<u64>() / 1024 / 1024;
                 n.total_mb = total;
@@ -246,7 +256,7 @@ pub async fn refresh(st: &Arc<AppState>) {
                 n.stage = NodeStage::Connected;
                 n.error = None;
             }
-            Check::Online { info: None } => {
+            Check::Online { info: None, .. } => {
                 // attached: keep the numbers from before; refresh free memory from the beacon if any
                 if let Some(b) = &beacon { if b.free_mb > 0 { n.available_mb = b.free_mb; } }
                 if n.total_mb == 0 { if let Some(b) = &beacon { n.total_mb = b.ram_mb; n.usable_mb = usable_lan_mb(b.free_mb); } }
@@ -359,7 +369,9 @@ pub async fn wifi_node_update(state: State<'_, Arc<AppState>>, id: String) -> Re
         return Err("эта нода старше 0.3.1 и не умеет обновляться по Wi-Fi — обновите её один раз по USB или вручную (Argus-Node.apk)".into());
     }
     if d.src_port == 0 { return Err("адрес ответа ноды неизвестен — подождите пару секунд".into()); }
-    let msg = host_reply(crate::updater::NODE_UPDATE_PORT, crate::cluster::bundled_code(&state.bundled_node_version), true);
+    let helper = crate::helper::lan_assignment(&state, &id).await;
+    let msg = host_reply(crate::updater::NODE_UPDATE_PORT, crate::cluster::bundled_code(&state.bundled_node_version), true, Some(helper));
+    let msg = crate::roles_extra::extend_lan_reply(msg, &id);
     let sock = UdpSocket::bind(("0.0.0.0", 0)).await.map_err(|e| e.to_string())?;
     sock.send_to(&msg, (d.host.as_str(), d.src_port)).await.map_err(|e| e.to_string())?;
     Ok(format!("Запрос отправлен на «{}» — подтвердите обновление на самом устройстве", d.name))

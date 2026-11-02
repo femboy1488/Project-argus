@@ -14,7 +14,7 @@ body { background: #111418; font-feature-settings: "tnum" 1, "cv11" 1; }
 }
 @layer components {
   .panel { @apply border border-pl-line bg-pl-bg1; }
-  .panel-head { @apply flex h-8 items-center justify-between border-b border-pl-line bg-pl-bg2 px-3 text-2xs font-semibold uppercase tracking-[0.12em] text-pl-mute; }
+  .panel-head { @apply flex h-8 shrink-0 items-center justify-between border-b border-pl-line bg-pl-bg2 px-3 text-2xs font-semibold uppercase tracking-[0.12em] text-pl-mute; }
   .label { @apply text-2xs font-semibold uppercase tracking-[0.12em] text-pl-dim; }
   .btn { @apply inline-flex shrink-0 whitespace-nowrap h-7 items-center gap-1.5 rounded border border-pl-line2 bg-pl-bg3 px-2.5 text-xs text-pl-text hover:bg-pl-bg4 disabled:cursor-not-allowed disabled:opacity-40; }
   .btn-primary { @apply inline-flex shrink-0 whitespace-nowrap h-7 items-center gap-1.5 rounded bg-pl-blue2 px-2.5 text-xs font-medium text-white hover:bg-[#215DB0] disabled:cursor-not-allowed disabled:bg-pl-bg3 disabled:text-pl-dim; }

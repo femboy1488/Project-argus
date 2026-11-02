@@ -1,5 +1,6 @@
 //! Persistent user settings (JSON in the app config dir): LAN nodes, per-device speed weights,
-//! disabled devices, fast start, Wi-Fi auto-add, keep-loaded + last deploy, update checks / skipped versions.
+//! disabled devices, fast start, Wi-Fi auto-add, keep-loaded + last deploy, update checks / skipped versions,
+//! 0.3.2: node roles, autobench cache, «Роли» experiment + helper model.
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -47,13 +48,37 @@ pub struct Settings {
     pub skipped_version: Option<String>,
     /// «Пропустить эту версию» for the bundled node APK ("0.3.1 (5)") — USB nodes are not offered it again
     pub skipped_node_version: Option<String>,
+    /// 0.3.2 node role per node id: "auto" (default) | "model" («Часть модели») | "free" («Свободна») | "helper"
+    pub roles: HashMap<String, String>,
+    /// 0.3.2 autobench cache: "<serial or lan id>|<node app version>" -> result
+    pub bench: HashMap<String, BenchResult>,
+    /// 0.3.2 experiment «Роли» (off by default): the «Помощник» role and everything that uses it
+    pub roles_enabled: bool,
+    /// helper model id (helper::HELPER_MODELS) — what a «Помощник» node runs
+    pub helper_model: String,
+    /// speculative decoding with a small draft model (-md), off by default
+    pub draft_enabled: bool,
+    /// local draft .gguf (None = first *.gguf in <models>/draft/)
+    pub draft_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchResult {
+    /// effective GB/s of int8 weights (argus-bench)
+    pub gbps: f32,
+    pub threads: u32,
+    /// unix seconds
+    pub at: u64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self { lan_nodes: vec![], weights: HashMap::new(), disabled: HashSet::new(), enabled: HashSet::new(), fast_start: true,
                auto_add_discovered: false, keep_loaded: true, last_launch: None,
-               check_updates: true, skipped_version: None, skipped_node_version: None }
+               check_updates: true, skipped_version: None, skipped_node_version: None,
+               roles: HashMap::new(), bench: HashMap::new(), roles_enabled: false, helper_model: String::new(),
+               draft_enabled: false, draft_path: None }
     }
 }
 

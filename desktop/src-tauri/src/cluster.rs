@@ -128,6 +128,7 @@ pub async fn start(app: AppHandle, st: Arc<AppState>) {
     seed_ports_from_forwards(&st).await;
     crate::llama::startup(&app, &st).await; // orphan llama-server: adopt (keep loaded) or kill
     { let s = st.clone(); tauri::async_runtime::spawn(async move { refresh_gpus(&s).await }); }
+    { let s = st.clone(); tauri::async_runtime::spawn(async move { cpu_autobench(&s, false).await; }); }
 
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("adb", POLL, move || { let (a, s) = (a.clone(), s.clone()); async move { adb_tick(&a, &s).await } }); }
     {
@@ -146,6 +147,7 @@ pub async fn start(app: AppHandle, st: Arc<AppState>) {
     { let s = st.clone(); spawn_loop("lan", Duration::from_secs(2), move || { let s = s.clone(); async move { lan::refresh(&s).await } }); }
     lan::start_beacon_listener(app.clone(), st.clone());
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("engine", Duration::from_secs(1), move || { let (a, s) = (a.clone(), s.clone()); async move { crate::llama::supervise(&a, &s).await } }); }
+    { let (a, s) = (app.clone(), st.clone()); spawn_loop("helper", Duration::from_secs(3), move || { let (a, s) = (a.clone(), s.clone()); async move { crate::helper::tick(&a, &s).await } }); }
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("emit", Duration::from_secs(1), move || { let (a, s) = (a.clone(), s.clone()); async move { emit(&a, &s).await } }); }
 }
 
@@ -404,9 +406,14 @@ async fn provision(app: &AppHandle, st: &Arc<AppState>, d: &AdbDevice, gen: u64)
         if !up { bail!("rpc-server не запустился на порту {DEVICE_RPC_PORT} устройства (откройте Argus Node, там лог): {last_err}"); }
     }
 
-    // 4. Sync memory.
+    // 4. Sync memory; 0.3.2: round trip + autobench (once per device and node version, cached).
     set_stage(st, serial, NodeStage::Syncing).await;
     emit(app, st).await;
+    let rtt = if engine_attached { None } else { measure_rtt(&endpoint).await };
+    let version = st.nodes.lock().await.get(serial).and_then(|n| n.version.clone());
+    if !engine_attached {
+        if let Some(v) = version.as_deref() { autobench(app, st, serial, v, false).await; }
+    }
     let (total_kb, avail_kb) = adb.meminfo(serial).await?;
     if st.runtime.lock().await.get(serial).map(|r| r.gen) != Some(gen) { bail!("устройство переподключено во время подготовки"); }
     let mut nodes = st.nodes.lock().await;
@@ -417,7 +424,83 @@ async fn provision(app: &AppHandle, st: &Arc<AppState>, d: &AdbDevice, gen: u64)
     n.endpoint = Some(endpoint);
     n.stage = NodeStage::Connected;
     n.error = None;
+    if rtt.is_some() { n.rtt_ms = rtt; }
     Ok(())
+}
+
+/// Best of 3 rpc queries (HELLO + DEVICE_COUNT + GET_DEVICE_MEMORY ≈ 3 round trips each), in ms per round trip.
+async fn measure_rtt(endpoint: &str) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        if lan::rpc_query(endpoint).await.is_ok() {
+            let ms = t0.elapsed().as_secs_f32() * 1000.0 / 3.0;
+            best = Some(best.map_or(ms, |b: f32| b.min(ms)));
+        }
+    }
+    best
+}
+
+/// 0.3.2 autobench of a USB node: push argus-bench (dotprod build when the CPU has it, like rpc-server) to
+/// /data/local/tmp and run it for ~1.5 s on the big cores. Result (GB/s of int8 weights) is cached in settings per
+/// device + node app version, so it runs once. `force` = «Повторить тест».
+pub async fn autobench(app: &AppHandle, st: &Arc<AppState>, serial: &str, version: &str, force: bool) -> Option<f32> {
+    let key = crate::state::bench_key(serial, version);
+    if !force {
+        if let Some(b) = st.settings.lock().await.bench.get(&key) { return Some(b.gbps); }
+    }
+    if !st.benching.lock().await.insert(serial.to_string()) { return None; }
+    let r = run_bench(st, serial).await;
+    st.benching.lock().await.remove(serial);
+    match r {
+        Ok((gbps, threads)) => {
+            log::info!("{serial}: autobench {gbps:.2} GB/s ({threads} threads)");
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            st.settings.lock().await.bench.insert(key, crate::settings::BenchResult { gbps, threads, at });
+            st.save_settings().await;
+            if let Some(n) = st.nodes.lock().await.get_mut(serial) { n.bench_gbps = Some(gbps); }
+            Some(gbps)
+        }
+        Err(e) => {
+            log::warn!("{serial}: autobench failed: {e:#}");
+            if force { toast(app, "warn", &format!("Тест скорости не удался: {e:#}")); }
+            None
+        }
+    }
+}
+
+async fn run_bench(st: &AppState, serial: &str) -> Result<(f32, u32)> {
+    let res = st.apk_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())).ok_or_else(|| anyhow!("нет папки resources"))?;
+    let feats = st.adb.shell(serial, "grep -m1 -i '^features' /proc/cpuinfo").await.unwrap_or_default();
+    let dot = feats.split_whitespace().any(|f| f == "asimddp");
+    let bin = res.join(if dot { "argus-bench-a64-dotprod" } else { "argus-bench-a64" });
+    if !bin.exists() { bail!("{} не найден", bin.display()); }
+    let b = bin.to_string_lossy();
+    st.adb.run_timeout(&["-s", serial, "push", &b, "/data/local/tmp/argus-bench"], Duration::from_secs(30)).await?;
+    let out = st.adb.run_timeout(&["-s", serial, "shell", "chmod 755 /data/local/tmp/argus-bench && /data/local/tmp/argus-bench -s 1.5"],
+        Duration::from_secs(25)).await?;
+    parse_bench(&out).ok_or_else(|| anyhow!("непонятный ответ теста: {}", out.trim().chars().take(160).collect::<String>()))
+}
+
+/// `{"argus":"bench","v":1,"gbps":12.34,"threads":4,...}` → (gbps, threads)
+pub fn parse_bench(out: &str) -> Option<(f32, u32)> {
+    let line = out.lines().find(|l| l.contains("\"argus\":\"bench\""))?;
+    let j: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let g = j["gbps"].as_f64()? as f32;
+    (g.is_finite() && g > 0.0).then(|| (g, j["threads"].as_u64().unwrap_or(0) as u32))
+}
+
+/// «Повторить тест скорости» in the inspector (USB nodes; Wi-Fi nodes measure themselves and send it in the beacon).
+#[tauri::command]
+pub async fn rebench_node(app: AppHandle, state: State<'_, Arc<AppState>>, id: String) -> Result<f32, String> {
+    let st = state.inner().clone();
+    if id.starts_with("lan:") { return Err("Wi-Fi нода измеряет скорость сама и присылает её в маяке".into()); }
+    let ep = st.nodes.lock().await.get(&id).and_then(|n| n.endpoint.clone());
+    if let Some(ep) = &ep {
+        if crate::llama::engine_uses_endpoint(&st, ep).await { return Err("Нода сейчас считает модель — тест исказится. Остановите модель или сделайте ноду «Свободной»".into()); }
+    }
+    let version = st.nodes.lock().await.get(&id).and_then(|n| n.version.clone()).ok_or("нода ещё не готова")?;
+    autobench(&app, &st, &id, &version, true).await.ok_or_else(|| "тест не удался — подробности в журнале".to_string())
 }
 
 /// Forward on the remembered port; if something else holds it, take the next free one.
@@ -516,8 +599,17 @@ async fn refresh_metrics(st: &AppState, serial: &str) -> bool {
             _ => None,
         }
     };
+    // thermal state from the node app (dumpsys line `argus-status {json}`), every 5th poll
+    let due = {
+        let mut rt = st.runtime.lock().await;
+        rt.get_mut(serial).map(|r| { r.status_tick += 1; r.status_tick % 5 == 1 }).unwrap_or(false)
+    };
+    let status = if due {
+        st.adb.shell(serial, &format!("dumpsys activity service {NODE_PKG}/.RpcService")).await.ok().and_then(|d| parse_status(&d))
+    } else { None };
     if let Some(n) = st.nodes.lock().await.get_mut(serial) {
         if n.stage != NodeStage::Connected { return true; }
+        if let Some((t, th)) = status { n.temp_c = t; n.throttled = th; }
         if let Some((_, avail_kb)) = mem { n.available_mb = avail_kb / 1024; }
         if let Some(p) = load { n.load_pct = p; }
         // usable_mb is frozen at sync time on purpose: llama.cpp's own allocation lowers MemAvailable.
@@ -546,7 +638,89 @@ pub async fn refresh_gpus(st: &AppState) {
     *st.gpus.lock().await = list;
 }
 
+/// PC CPU pseudo-node bench (~1 s int8 dot loop), cached in settings.bench under `cpu|<brand>|<threads>`.
+/// Never runs while the engine is busy (it would measure the engine, not the CPU).
+pub async fn cpu_autobench(st: &Arc<AppState>, force: bool) -> Option<f32> {
+    let (brand, threads) = tokio::task::spawn_blocking(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_all();
+        let brand = sys.cpus().first().map(|c| c.brand().trim().to_string()).filter(|b| !b.is_empty()).unwrap_or_else(|| "CPU".into());
+        (brand, crate::state::cpu_threads())
+    }).await.ok()?;
+    let key = crate::state::cpu_bench_key(&brand, threads);
+    {
+        let mut c = st.cpu.lock().await;
+        c.brand = brand.clone(); c.threads = threads;
+        if !force {
+            if let Some(b) = st.settings.lock().await.bench.get(&key) { c.gbps = Some(b.gbps); return Some(b.gbps); }
+        }
+        if c.benching { return None; }
+        c.benching = true;
+    }
+    // wait (max 10 min) for an idle engine
+    for _ in 0..600 {
+        if !crate::llama::engine_running(st).await { break; }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let gbps = tokio::task::spawn_blocking(move || crate::state::cpu_bench(threads, 1.0)).await.ok().filter(|g| g.is_finite() && *g > 0.0);
+    let mut c = st.cpu.lock().await;
+    c.benching = false;
+    if let Some(g) = gbps {
+        c.gbps = Some(g);
+        drop(c);
+        log::info!("PC CPU bench: {g:.2} GB/s ({threads} threads, {brand})");
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        st.settings.lock().await.bench.insert(key, crate::settings::BenchResult { gbps: g, threads, at });
+        st.save_settings().await;
+    }
+    gbps
+}
+
+/// `{"temp_c":41.5,"throttled":false}` from the node's dumpsys line `argus-status {json}`.
+pub fn parse_status(dump: &str) -> Option<(Option<f32>, Option<bool>)> {
+    let line = dump.lines().find_map(|l| l.trim().strip_prefix("argus-status "))?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let t = v.get("temp_c").and_then(|x| x.as_f64()).map(|x| x as f32).filter(|t| t.is_finite() && *t > -40.0 && *t < 150.0);
+    let th = v.get("throttled").and_then(|x| x.as_bool());
+    Some((t, th))
+}
+
+/// «Экспорт результатов тестов» — Markdown, device names only (no serials / addresses).
+#[tauri::command]
+pub async fn export_bench_results(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let snap = state.snapshot().await;
+    let mut md = String::new();
+    md.push_str(&format!("# Argus — результаты тестов скорости\n\nВерсия: {} · платформа: {}\n\n", snap.app_version, snap.platform));
+    md.push_str("| Устройство | Тип | Скорость, ГБ/с | Измерено | Потоки | Память для модели, МБ | Температура |\n|---|---|---|---|---|---|---|\n");
+    let c = &snap.cpu;
+    md.push_str(&format!("| {} ({}) | ЦП ПК | {} | {} | {} | {} | — |\n", crate::split::CPU_NAME, c.brand.replace('|', "/"),
+        c.gbps.map(|g| format!("{g:.2}")).unwrap_or("—".into()), if c.gbps.is_some() { "да" } else { "нет" }, c.threads, c.usable_mb));
+    let bench = state.settings.lock().await.bench.clone();
+    let threads_of = |id: &str| bench.iter().filter(|(k, _)| k.starts_with(&format!("{id}|"))).map(|(_, b)| b.threads).max();
+    for n in snap.gpus.iter().chain(snap.nodes.iter()) {
+        let kind = match n.kind { NodeKind::Gpu => "GPU", NodeKind::Cpu => "ЦП", NodeKind::Phone => "телефон", NodeKind::Tablet => "телефон", NodeKind::Lan => "сеть" };
+        let temp = match (n.temp_c, n.throttled) {
+            (Some(t), Some(true)) => format!("{t:.0} °C, троттлинг"), (Some(t), _) => format!("{t:.0} °C"),
+            (None, Some(true)) => "троттлинг".into(), _ => "—".into() };
+        md.push_str(&format!("| {} | {} | {:.2} | {} | {} | {} | {} |\n", n.name.replace('|', "/"), kind, n.speed,
+            if n.speed_measured { "да" } else { "оценка" }, threads_of(&n.id).map(|t| t.to_string()).unwrap_or("—".into()), n.usable_mb, temp));
+    }
+    let p = &snap.plan;
+    md.push_str("\n## План разбиения\n\n");
+    if let Some(need) = p.need_mb { md.push_str(&format!("Модель + контекст: {need} МБ · помещается: {}\n\n", if p.fits { "да" } else { "нет" })); }
+    for e in &p.entries { md.push_str(&format!("- {} ({}): {:.0} %\n", e.name, e.device, e.share * 100.0)); }
+    if p.cpu_layers > 0 { md.push_str(&format!("- слоёв на ЦП ПК: {} (-t {})\n", p.cpu_layers, p.threads.unwrap_or(0))); }
+    if let Some(m) = &p.moe { md.push_str(&format!("- MoE: {} экспертов (активно {}), блоков на GPU: {} из {}\n", m.expert_count, m.expert_used, m.gpu_blocks.len(), m.block_count)); }
+    if let Some(t) = p.est_tps { md.push_str(&format!("\nОценка скорости: ≈{t:.1} ток/с\n")); }
+    Ok(md)
+}
+
 async fn refresh_host(st: &AppState, sys: &mut sysinfo::System) {
+    // PC CPU pseudo-node: RAM it may lend to the model (frozen while the engine runs: its own allocation lowers it)
+    if !crate::llama::engine_running(st).await {
+        sys.refresh_memory();
+        st.cpu.lock().await.usable_mb = sys.available_memory() / 1024 / 1024 / 2;
+    }
     let nv = gpu::query_nvidia_all().await;
     // live numbers for NVIDIA cards, matched to llama.cpp devices by name
     {
@@ -664,6 +838,10 @@ mod tests {
         assert!(!node_outdated(Some(&("0.3.1".into(), Some(5))), "0.3.1 (5)"));
         assert_eq!(bundled_code("0.3.1 (5)"), Some(5));
         assert_eq!(bundled_code("0.3"), None);
-        assert_eq!(crate::default_node_version(), "0.3.1 (5)");
+        assert_eq!(crate::default_node_version(), "0.3.3 (7)");
+        assert_eq!(parse_bench("{\"argus\":\"bench\",\"v\":1,\"gbps\":12.93,\"threads\":2}\n"), Some((12.93, 2)));
+        assert_eq!(parse_bench("sh: not found"), None);
+        assert_eq!(parse_status("x\n  argus-status {\"temp_c\":44.5,\"throttled\":true}\n"), Some((Some(44.5), Some(true))));
+        assert_eq!(parse_status("nothing"), None);
     }
 }

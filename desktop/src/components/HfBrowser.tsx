@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { ChevronRight, Download, ExternalLink, Heart, Loader2, Rocket, Search } from "lucide-react";
 import { useCluster } from "../store/cluster";
-import { fitLevel, kvGuess, paramsFromName, quantOf, requiredMb } from "../lib/models";
+import { fitLevel, kvGuess, modelPoolMb, paramsFromName, quantOf, requiredMb } from "../lib/models";
 import { openExternal } from "../lib/api";
 import { deploy } from "../lib/launch";
 import { gb } from "../lib/format";
@@ -38,10 +38,10 @@ export default function HfBrowser() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <form className="flex gap-2 border-b border-pl-line p-2" onSubmit={(e) => { e.preventDefault(); search(); }}>
-        <div className="flex flex-1 items-center gap-2 border border-pl-line2 bg-pl-bg0 px-2 focus-within:border-pl-blue">
+        <div className="flex min-w-0 flex-1 items-center gap-2 border border-pl-line2 bg-pl-bg0 px-2 focus-within:border-pl-blue">
           <Search size={13} className="text-pl-dim" />
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Название модели: qwen3, llama 3.1 8b, gemma, mistral…"
-            className="h-8 flex-1 bg-transparent text-sm text-pl-text outline-none placeholder:text-pl-dim" />
+            className="h-8 min-w-0 flex-1 bg-transparent text-sm text-pl-text outline-none placeholder:text-pl-dim" />
         </div>
         <button className="btn-primary h-8" disabled={busy}>{busy ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />} Искать</button>
         <button type="button" className="btn h-8" onClick={() => openExternal(`https://huggingface.co/models?library=gguf&sort=downloads&search=${encodeURIComponent(q)}`)}>
@@ -99,7 +99,7 @@ function Row({ m, open, toggle }: { m: HfModel; open: boolean; toggle: () => voi
 
 function Files({ repo, vision, moe }: { repo: string; vision: boolean; moe: boolean }) {
   const { snapshot, ctx, run } = useCluster();
-  const usable = snapshot?.usableMb ?? 0;
+  const usable = modelPoolMb(snapshot);
   const [files, setFiles] = useState<GgufFile[] | null>(null);
   const [mmproj, setMmproj] = useState(0);
   const [err, setErr] = useState<string | null>(null);

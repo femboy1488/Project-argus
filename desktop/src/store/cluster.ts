@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { ChatMessage, ClusterSnapshot, Conversation, ModelRunState, SpeedSettings, UpdateProgress, UpdateStatus } from "../lib/types";
 import { uid } from "../lib/format";
 
-export type View = "chat" | "devices" | "models" | "api";
+export type View = "chat" | "devices" | "models" | "api" | "parallel" | "features" | "queue" | "knowledge";
 
 export const SYSTEM_PRESETS: { id: string; label: string; prompt: string }[] = [
   { id: "none", label: "Без системного промпта", prompt: "" },
@@ -35,7 +35,7 @@ function persist(convs: Conversation[], active: string) {
   saveTimer = setTimeout(() => {
     try {
       // screenshots are large: keep them out of localStorage
-      const slim = convs.map((c) => ({ ...c, messages: c.messages.map((m) => (m.image ? { ...m, image: undefined, content: m.content + " [скриншот]" } : m)) }));
+      const slim = convs.map((c) => ({ ...c, messages: c.messages.map((m) => (m.image ? { ...m, image: undefined, content: m.content + " [скриншот]" } : m.images?.length ? { ...m, images: undefined, content: m.content + ` [фото: ${m.images.length}]` } : m)) }));
       localStorage.setItem(LS_CONV, JSON.stringify(slim));
       localStorage.setItem(LS_ACTIVE, active);
     } catch { /* quota */ }
@@ -145,7 +145,9 @@ export const useCluster = create<State>((set, get) => {
     },
     dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
     setModelsTab: (modelsTab) => set({ modelsTab }),
-    setDl: (dlBytes) => set({ dlBytes }),
+    // llama-dl = bytes added to the model cache since *a* start; an engine restart mid-download spawns a second
+    // watcher with a later baseline, so two series interleave. Never go backwards within one load.
+    setDl: (b) => set((s) => (Number.isFinite(b) && b > s.dlBytes ? { dlBytes: b } : {})),
     pushEngineLog: (l) => set((s) => {
       const log = s.engineLog.slice(-400);
       // collapse consecutive progress redraws of the same download into one line
@@ -162,7 +164,8 @@ export const useCluster = create<State>((set, get) => {
     setWizard: (wizardOpen) => set({ wizardOpen }),
     setLanDialog: (lanDialog) => set({ lanDialog }),
     setTour: (tourOpen) => { if (!tourOpen) localStorage.setItem("argus.tourDone", "1"); set({ tourOpen }); },
-    setRun: (run) => set({ run }),
+    // a new load starts its download readout from zero (old values would show a stale 100%)
+    setRun: (run) => set((s) => (run.status === "loading" && s.run.status !== "loading" ? { run, dlBytes: 0 } : { run })),
 
     newChat: () => set((s) => {
       const cur = s.conversations.find((c) => c.id === s.activeId);

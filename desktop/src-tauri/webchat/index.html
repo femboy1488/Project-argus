@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="theme-color" content="#0d0f14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>Argus Chat</title>
+<style>
+:root{--bg:#0d0f14;--panel:#161a22;--line:#262c38;--text:#e6e8ee;--muted:#8a93a6;--acc:#6aa8ff;--user:#1f3b66}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+body{display:flex;flex-direction:column;height:100dvh}
+header{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+header b{font-size:17px}
+#model{color:var(--muted);font-size:13px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+header button{background:none;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:6px 10px;font-size:14px}
+#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.m{max-width:88%;padding:9px 12px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+.u{align-self:flex-end;background:var(--user);border-bottom-right-radius:4px}
+.a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+.a .who{display:block;color:var(--muted);font-size:11px;margin-bottom:3px}
+.err{align-self:center;color:#ff8a8a;font-size:14px;text-align:center}
+.m img{max-width:100%;border-radius:8px;display:block;margin-bottom:6px}
+pre{background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:8px;overflow-x:auto;white-space:pre;font-size:13px}
+code{font-family:ui-monospace,Consolas,monospace}
+#empty{margin:auto;color:var(--muted);text-align:center;padding:20px}
+form{display:flex;gap:8px;align-items:flex-end;padding:10px 10px calc(env(safe-area-inset-bottom) + 10px);border-top:1px solid var(--line);background:var(--panel)}
+textarea{flex:1;resize:none;max-height:140px;min-height:42px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:inherit}
+.ib{width:42px;height:42px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--text);font-size:20px;flex:none}
+#send{background:var(--acc);border-color:var(--acc);color:#081120}
+#thumbs{display:flex;gap:6px;padding:0 10px}
+#thumbs img{height:54px;border-radius:8px;margin-top:8px;border:1px solid var(--line)}
+#pinbox{margin:auto;display:none;flex-direction:column;gap:10px;padding:20px;width:min(320px,90%)}
+#pinbox input{font-size:22px;text-align:center;letter-spacing:6px;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text)}
+#pinbox button{padding:12px;border-radius:10px;border:0;background:var(--acc);color:#081120;font-size:16px}
+</style>
+</head>
+<body>
+<header><b>Argus</b><span id="model">…</span><button id="new" type="button">Новый чат</button></header>
+<div id="pinbox"><div>Введите PIN из Argus на компьютере (раздел «Возможности»).</div><input id="pin" inputmode="numeric" autocomplete="off"><button id="pinok" type="button">Войти</button></div>
+<div id="log"><div id="empty">Спросите что-нибудь.<br>Ответ генерирует кластер Argus на вашем компьютере.</div></div>
+<div id="thumbs"></div>
+<form id="f">
+  <input type="file" id="file" accept="image/*" multiple hidden>
+  <button class="ib" type="button" id="att" title="Фото">📎</button>
+  <textarea id="q" rows="1" placeholder="Сообщение…" enterkeyhint="send"></textarea>
+  <button class="ib" id="send" type="submit" title="Отправить">➤</button>
+</form>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const log = $('log'), q = $('q'), sendBtn = $('send');
+  let pin = '';
+  const m = location.hash.match(/pin=([^&]+)/);
+  if (m) { pin = decodeURIComponent(m[1]); localStorage.setItem('argusPin', pin); history.replaceState(null, '', '/'); }
+  else pin = localStorage.getItem('argusPin') || '';
+  let history_ = JSON.parse(sessionStorage.getItem('argusChat') || '[]');
+  let images = [];
+  let busy = false, ctrl = null;
+
+  const save = () => sessionStorage.setItem('argusChat', JSON.stringify(history_.slice(-40)));
+  const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const fmt = s => {
+    s = s.replace(/<think>[\s\S]*?(<\/think>|$)/g, '');
+    const parts = s.split(/```/);
+    return parts.map((p, i) => i % 2 ? '<pre><code>' + esc(p.replace(/^[\w+-]*\n/, '')) + '</code></pre>' : esc(p)).join('');
+  };
+  function bubble(role, text, imgs, who) {
+    const e = $('empty'); if (e) e.remove();
+    const d = document.createElement('div');
+    d.className = 'm ' + (role === 'user' ? 'u' : 'a');
+    (imgs || []).forEach(src => { const i = new Image(); i.src = src; d.appendChild(i); });
+    if (role !== 'user') { const w = document.createElement('span'); w.className = 'who'; w.textContent = who || ''; d.appendChild(w); }
+    const t = document.createElement('div'); t.innerHTML = fmt(text || ''); d.appendChild(t);
+    log.appendChild(d); log.scrollTop = log.scrollHeight;
+    return { d, t, w: d.querySelector('.who') };
+  }
+  function errMsg(s) { const d = document.createElement('div'); d.className = 'err'; d.textContent = s; log.appendChild(d); log.scrollTop = log.scrollHeight; }
+  function render() {
+    history_.forEach(x => {
+      const imgs = Array.isArray(x.content) ? x.content.filter(p => p.type === 'image_url').map(p => p.image_url.url) : [];
+      const text = Array.isArray(x.content) ? x.content.filter(p => p.type === 'text').map(p => p.text).join('\n') : x.content;
+      bubble(x.role, text, imgs, x.model);
+    });
+  }
+  function askPin(msg) {
+    $('pinbox').style.display = 'flex'; log.style.display = 'none'; $('f').style.display = 'none';
+    if (msg) $('pinbox').firstElementChild.textContent = msg;
+  }
+  $('pinok').onclick = () => {
+    pin = $('pin').value.trim(); localStorage.setItem('argusPin', pin);
+    $('pinbox').style.display = 'none'; log.style.display = ''; $('f').style.display = ''; ping();
+  };
+  async function ping() {
+    if (!pin) return askPin();
+    try {
+      const r = await fetch('/api/ping', { headers: { 'X-Argus-Pin': pin } });
+      if (r.status === 401) return askPin('Неверный PIN. Введите PIN из Argus («Возможности»).');
+      const j = await r.json();
+      $('model').textContent = (j.engine ? '● ' : '○ ') + j.model + (j.engine ? '' : ' — не запущена');
+    } catch (e) { $('model').textContent = 'нет связи с компьютером'; }
+  }
+
+  $('att').onclick = () => $('file').click();
+  $('file').onchange = async ev => {
+    for (const f of ev.target.files) images.push(await shrink(f));
+    ev.target.value = ''; thumbs();
+  };
+  function thumbs() {
+    $('thumbs').innerHTML = '';
+    images.forEach((src, i) => { const im = new Image(); im.src = src; im.onclick = () => { images.splice(i, 1); thumbs(); }; $('thumbs').appendChild(im); });
+  }
+  // phone photos are huge: downscale to ≤1280 px JPEG before sending
+  function shrink(file) {
+    return new Promise(res => {
+      const rd = new FileReader();
+      rd.onload = () => {
+        const im = new Image();
+        im.onload = () => {
+          const k = Math.min(1, 1280 / Math.max(im.width, im.height));
+          const c = document.createElement('canvas'); c.width = Math.round(im.width * k); c.height = Math.round(im.height * k);
+          c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+          res(c.toDataURL('image/jpeg', 0.85));
+        };
+        im.onerror = () => res(rd.result);
+        im.src = rd.result;
+      };
+      rd.readAsDataURL(file);
+    });
+  }
+  q.addEventListener('input', () => { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 140) + 'px'; });
+  q.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); $('f').requestSubmit(); } });
+  $('new').onclick = () => { if (ctrl) ctrl.abort(); history_ = []; save(); log.innerHTML = '<div id="empty">Новый чат.</div>'; };
+
+  $('f').onsubmit = async e => {
+    e.preventDefault();
+    if (busy) { if (ctrl) ctrl.abort(); return; }
+    const text = q.value.trim();
+    if (!text && !images.length) return;
+    const content = images.length ? [{ type: 'text', text: text || 'Что на фото?' }, ...images.map(u => ({ type: 'image_url', image_url: { url: u } }))] : text;
+    bubble('user', typeof content === 'string' ? content : content[0].text, images);
+    history_.push({ role: 'user', content });
+    q.value = ''; q.style.height = 'auto'; images = []; thumbs();
+    const b = bubble('assistant', '', null, '…');
+    busy = true; sendBtn.textContent = '■'; ctrl = new AbortController();
+    let out = '', model = '';
+    try {
+      const r = await fetch('/api/chat', {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', 'X-Argus-Pin': pin },
+        body: JSON.stringify({ messages: history_.map(x => ({ role: x.role, content: x.content })), stream: true })
+      });
+      model = r.headers.get('X-Argus-Model') || '';
+      b.w.textContent = model + (r.headers.get('X-Argus-Kind') === 'helper' ? ' · помощник' : '');
+      if (r.status === 401) { b.d.remove(); history_.pop(); return askPin('Неверный PIN.'); }
+      if (!r.ok || !r.body) { const t = await r.text(); let msg = t; try { msg = JSON.parse(t).error; msg = msg.message || msg; } catch (_) {} throw new Error(msg || ('HTTP ' + r.status)); }
+      const rd = r.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          try { const j = JSON.parse(data); const d = j.choices && j.choices[0] && j.choices[0].delta; if (d && d.content) { out += d.content; b.t.innerHTML = fmt(out); log.scrollTop = log.scrollHeight; } } catch (_) {}
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') errMsg('Ошибка: ' + err.message);
+    } finally {
+      busy = false; sendBtn.textContent = '➤'; ctrl = null;
+      out = out.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trim();
+      if (out) { history_.push({ role: 'assistant', content: out, model }); save(); } else if (!b.t.textContent) b.d.remove();
+    }
+  };
+  render(); ping();
+})();
+</script>
+</body>
+</html>

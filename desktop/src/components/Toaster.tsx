@@ -15,7 +15,7 @@ export default function Toaster() {
   const { toasts, dismissToast } = useCluster();
   if (!toasts.length) return null;
   return (
-    <div className="pointer-events-none fixed bottom-8 right-4 z-[60] flex w-[380px] flex-col gap-2">
+    <div className="pointer-events-none fixed bottom-8 right-4 z-[60] flex w-[380px] max-w-[calc(100vw-2rem)] flex-col gap-2">
       {toasts.map((t) => {
         const I = ICON[t.kind];
         return (

@@ -9,6 +9,10 @@ import ChatView from "./components/ChatView";
 import DevicePanel from "./components/DevicePanel";
 import ModelLibrary from "./components/ModelLibrary";
 import ApiPanel from "./components/ApiPanel";
+import ParallelTest from "./components/ParallelTest";
+import FeaturesView from "./components/FeaturesView";
+import QueueView from "./components/QueueView";
+import KnowledgeView from "./components/KnowledgeView";
 import UsbWizard from "./components/UsbWizard";
 import StatusBar from "./components/StatusBar";
 import LanDialog from "./components/LanDialog";
@@ -53,7 +57,12 @@ export default function App() {
     platformInfo().then(setPlatform).catch(() => {});
     let off4: (() => void) | undefined;
     let off5: (() => void) | undefined;
-    onEngineState((e) => applyEngine(e, true)).then((f) => (off4 = f));
+    onEngineState((e) => {
+      // keep snapshot.engine fresh between cluster updates («Прогрев…» ends with an engine-state event)
+      const snap = useCluster.getState().snapshot;
+      if (snap) { const { toast: _t, ...engine } = e; setSnapshot({ ...snap, engine }); }
+      applyEngine(e, true);
+    }).then((f) => (off4 = f));
     onToast((t) => useCluster.getState().pushToast(t.kind, t.text)).then((f) => (off5 = f));
     onLlamaLog((line) => {
       useCluster.getState().pushEngineLog(line);
@@ -66,15 +75,19 @@ export default function App() {
   }, [setSnapshot, setRun]);
 
   return (
-    <div className="flex h-full flex-col text-pl-text">
+    <div className="flex h-full min-w-0 flex-col overflow-hidden text-pl-text">
       <TopBar />
       <div className="flex min-h-0 flex-1">
         <NavRail />
-        <main className="min-w-0 flex-1">
+        <main className="min-h-0 min-w-0 flex-1 overflow-hidden">
           {view === "chat" && <ChatView />}
           {view === "devices" && <DevicePanel />}
           {view === "models" && <ModelLibrary />}
           {view === "api" && <ApiPanel />}
+          {view === "parallel" && <ParallelTest />}
+          {view === "features" && <FeaturesView />}
+          {view === "queue" && <QueueView />}
+          {view === "knowledge" && <KnowledgeView />}
         </main>
       </div>
       <StatusBar />

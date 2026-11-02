@@ -39,6 +39,9 @@ class MainActivity : Activity() {
     private lateinit var pill: TextView; private lateinit var title: TextView; private lateinit var hint: TextView
     private lateinit var toggle: Button; private lateinit var logView: TextView; private lateinit var logScroll: ScrollView
     private lateinit var checks: LinearLayout
+    private lateinit var roleTitle: TextView; private lateinit var roleHint: TextView; private lateinit var roleHelper: TextView
+    private lateinit var roleSide: TextView; private lateinit var zimStatus: TextView; private lateinit var zimButton: Button
+    private lateinit var heatHint: TextView
     private lateinit var wifiToggle: Button; private lateinit var wifiAddr: TextView; private lateinit var wifiInfo: TextView
     private lateinit var wifiWarn: TextView; private lateinit var wifiBattery: Button
     private lateinit var updVersion: TextView; private lateinit var updStatus: TextView; private lateinit var updButton: Button
@@ -87,6 +90,19 @@ class MainActivity : Activity() {
             addView(title); addView(hint); addView(toggle)
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
 
+        // 0.3.2 roles: what this device does for Argus right now
+        root.addView(section("Роль"))
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = box(PANEL); setPadding(dp(16), dp(14), dp(16), dp(14))
+            roleTitle = label("", 18f, TEXT, mono = false).apply { setTypeface(Typeface.DEFAULT, Typeface.BOLD) }
+            roleHint = label("", 12f, DIM, mono = false).apply { setPadding(0, dp(4), 0, 0) }
+            roleHelper = label("", 12f, TEXT, mono = false).apply { setPadding(0, dp(8), 0, 0) }
+            roleSide = label("", 12f, TEXT, mono = false).apply { setPadding(0, dp(6), 0, 0) }
+            zimStatus = label("", 11f, DIM, mono = false).apply { setPadding(0, dp(10), 0, dp(6)) }
+            zimButton = btn("Выбрать .zim", CYAN) { pickZim() }
+            addView(roleTitle); addView(roleHint); addView(roleHelper); addView(roleSide); addView(zimStatus); addView(zimButton)
+        })
+
         // Wi-Fi mode: rpc-server on 0.0.0.0:50052 + UDP beacon so Argus finds the node on the home LAN
         root.addView(section("Wi-Fi режим"))
         root.addView(LinearLayout(this).apply {
@@ -113,7 +129,8 @@ class MainActivity : Activity() {
         // resources grid
         root.addView(section("Ресурсы"))
         val grid = GridLayout(this).apply { columnCount = if (resources.configuration.screenWidthDp > 600) 4 else 2 }
-        for (k in listOf("ОЗУ СВОБОДНО", "ОЗУ ВСЕГО", "ЯДРА CPU", "ПОТОКИ", "ВАРИАНТ", "КЭШ", "ПОРТ", "АПТАЙМ", "ПОДКЛ. ПК", "РЕСТАРТЫ")) {
+        for (k in listOf("ОЗУ СВОБОДНО", "ОЗУ ВСЕГО", "ЯДРА CPU", "ПОТОКИ", "ВАРИАНТ", "КЭШ", "ПОРТ", "АПТАЙМ", "ПОДКЛ. ПК", "РЕСТАРТЫ",
+                "ТЕМПЕРАТУРА", "БАТАРЕЯ", "ТРОТТЛИНГ", "USB-СЕТЬ")) {
             val v = label("—", 18f, TEXT)
             stat[k] = v
             grid.addView(LinearLayout(this).apply {
@@ -124,6 +141,9 @@ class MainActivity : Activity() {
             })
         }
         root.addView(grid)
+        heatHint = label("⚠ Если заряжается и греется — ограничь заряд до 85% в настройках батареи", 12f, AMBER, mono = false)
+            .apply { setPadding(0, dp(8), 0, 0); visibility = View.GONE }
+        root.addView(heatHint)
 
         // weight cache (rpc-server -c): tensors pushed once over USB are kept on the device
         root.addView(LinearLayout(this).apply {
@@ -158,6 +178,26 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent); setIntent(intent)
         if (intent.getBooleanExtra(Updater.EXTRA_SHOW, false)) { updForceShow = true; updAsked = null; maybeAskUpdate() }
+    }
+
+    // 0.3.3 «Библиотека»: pick a .zim with the system file picker, copy it into the app (kiwix-serve reads filesDir/zim)
+    private val REQ_ZIM = 42
+    private fun pickZim() {
+        if (Library.importPct in 0..99) return
+        runCatching {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), REQ_ZIM)
+        }.onFailure { Toast.makeText(this, "Нет файлового менеджера: ${it.message}", Toast.LENGTH_LONG).show() }
+    }
+
+    @Deprecated("Activity result API is androidx-only; this app has no androidx")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_ZIM || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        thread(name = "zim-import") {
+            val r = runCatching { Library.import(applicationContext, uri) }
+            ui.post { Toast.makeText(this, r.fold({ "Скопировано: $it" }, { "Ошибка: ${it.message}" }), Toast.LENGTH_LONG).show() }
+        }
     }
 
     private fun manualUpdateCheck() {
@@ -228,6 +268,7 @@ class MainActivity : Activity() {
     private fun report(): String {
         val m = memInfo()
         return "ARGUS node ${packageManager.getPackageInfo(packageName, 0).versionName} · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}\n" +
+            "helper=${Helper.state} model=${Helper.model} pct=${Helper.pct} err=${Helper.error} bench=${Bench.cached(this)}\n" +
             "state=${RpcService.state} mode=${if (RpcService.wifi) "wifi" else "usb"} host=${RpcService.host} ip=${RpcService.wifiIp} port=${RpcService.port} threads=${RpcService.threads} variant=${RpcService.variant} cpu=${RpcService.coreTiers} cache=${fmtBytes(cacheSize)} restarts=${RpcService.restarts} lastExit=${RpcService.lastExit}\n" +
             "ram free=${m.availMem shr 20}MB total=${m.totalMem shr 20}MB\n\n" + RpcService.logText()
     }
@@ -280,7 +321,17 @@ class MainActivity : Activity() {
         stat["РЕСТАРТЫ"]!!.text = RpcService.restarts.toString()
         stat["РЕСТАРТЫ"]!!.setTextColor(if (RpcService.restarts > 0) AMBER else TEXT)
 
+        val tl = Telemetry.read(this)
+        stat["ТЕМПЕРАТУРА"]!!.text = tl.tempC?.let { "%.0f °C".format(it) } ?: "—"
+        stat["ТЕМПЕРАТУРА"]!!.setTextColor(when { (tl.tempC ?: 0.0) >= 45 -> RED; (tl.tempC ?: 0.0) >= 40 -> AMBER; else -> TEXT })
+        stat["БАТАРЕЯ"]!!.text = if (tl.batteryPct >= 0) "${tl.batteryPct}%" + (if (tl.charging) " ⚡" else "") else "—"
+        stat["ТРОТТЛИНГ"]!!.text = if (Build.VERSION.SDK_INT < 29) "—" else if (tl.throttled) "да (${tl.thermalStatus})" else "нет"
+        stat["ТРОТТЛИНГ"]!!.setTextColor(if (tl.throttled) RED else TEXT)
+        stat["USB-СЕТЬ"]!!.text = tl.usbNetIp ?: "—"
+        heatHint.visibility = if (Telemetry.hotWhileCharging(tl)) View.VISIBLE else View.GONE
+
         renderWifi()
+        renderRole()
         renderChecks()
         updStatus.text = buildString {
             if (Updater.progress >= 0) append("Загрузка: ${Updater.progress}%") else append(Updater.status)
@@ -307,6 +358,59 @@ class MainActivity : Activity() {
             else -> "Слушает 0.0.0.0:${RpcService.port} · маяк UDP :${RpcService.BEACON_PORT} каждые 2 с (отправлено ${RpcService.beacons})"
         }
         wifiBattery.visibility = if (on && !batteryExempt()) View.VISIBLE else View.GONE
+    }
+
+    private fun renderRole() {
+        val h = Helper.state
+        val model = Helper.model?.removeSuffix(".gguf")
+        val linked = RpcService.state == RpcService.State.LINKED
+        val (t, c, sub) = when {
+            h == "idle" && (Voice.active || Library.active) -> Triple(listOfNotNull(if (Voice.active) "Голос" else null, if (Library.active) "Библиотека" else null).joinToString(" + "),
+                CYAN, "Работает рядом с основной моделью на малых ядрах." + (if (linked) " Заодно держит часть основной модели." else ""))
+            h != "idle" -> Triple("Помощник", CYAN, "Отвечает Argus на небольшие задачи своей маленькой моделью: названия чатов, сводки, параллельные ответы." +
+                (if (linked) " Заодно держит часть основной модели." else ""))
+            linked -> Triple("Часть модели", GREEN, "Хранит и считает часть слоёв большой модели вместе с ПК.")
+            RpcService.running -> Triple("Свободна", TEXT, "Готова к работе — Argus на ПК сам решит, чем её занять.")
+            else -> Triple("Свободна", DIM, "Узел выключен. Запустите его, чтобы Argus мог дать устройству роль.")
+        }
+        roleTitle.text = t; roleTitle.setTextColor(c); roleHint.text = sub
+        val bench = Bench.cached(this)
+        val benchText = when {
+            bench != null -> "Тест скорости: %.1f ГБ/с".format(bench)
+            Bench.running -> "Тест скорости: идёт…"
+            else -> null
+        }
+        val (helperText, hc) = when (h) {
+            "downloading" -> "Скачиваю модель ${model ?: ""}: ${Helper.pct}%" to AMBER
+            "starting" -> (if (Helper.error != null) "Модель ${model ?: ""} перезапускается после сбоя" else "Загружаю модель ${model ?: ""} в память…") to AMBER
+            "ready" -> "Модель ${model ?: ""} готова к работе" to GREEN
+            "error" -> "Не получилось запустить ${model ?: "модель"}: ${Helper.error ?: "неизвестная ошибка"}" to RED
+            else -> "" to DIM
+        }
+        roleHelper.text = listOfNotNull(helperText.ifEmpty { null }, benchText).joinToString("\n")
+        roleHelper.setTextColor(if (helperText.isEmpty()) DIM else hc)
+        roleHelper.visibility = if (roleHelper.text.isEmpty()) View.GONE else View.VISIBLE
+        // 0.3.3 voice + library lines
+        fun side(n: String, st: String, what: String?, err: String?, pct: Int, port: Int) = when (st) {
+            "idle" -> null
+            "downloading" -> "$n: скачиваю ${what ?: ""} ${pct}%"
+            "starting" -> "$n: запускаю ${what ?: ""}…"
+            "ready" -> "$n: готов, порт $port (${what ?: ""})"
+            else -> "$n: ошибка — ${err ?: "неизвестно"}"
+        }
+        val lines = listOfNotNull(side("Голос", Voice.state, Voice.model, Voice.error, Voice.pct, Voice.PORT),
+            side("Библиотека", Library.state, Library.zim, Library.error, 0, Library.PORT))
+        roleSide.text = lines.joinToString("\n")
+        roleSide.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
+        roleSide.setTextColor(if (Voice.state == "error" || Library.state == "error") RED else TEXT)
+        val zs = Library.zims(this)
+        zimStatus.text = when {
+            Library.importPct in 0..99 -> "Копирую .zim: ${Library.importPct}%"
+            Library.importMsg != null -> Library.importMsg!! + if (zs.isNotEmpty()) "\nНа телефоне: ${zs.joinToString { it.name }}" else ""
+            zs.isNotEmpty() -> "Офлайн-библиотека на телефоне: ${zs.joinToString { it.name }}"
+            else -> "Библиотека: выберите .zim (офлайн-Википедия Kiwix) — ПК сможет открыть её через этот телефон."
+        }
+        zimButton.isEnabled = Library.importPct !in 0..99
     }
 
     private fun renderChecks() {

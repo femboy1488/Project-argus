@@ -17,6 +17,10 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, time::timeout};
 
 pub const LLAMA_PORT: u16 = 8080;
 
+/// download counter generation (only the newest launch's loop reports) and its byte base
+static DL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DL_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StartModelArgs {
@@ -33,6 +37,157 @@ pub struct StartModelArgs {
     pub draft_max: Option<u32>,     // --spec-draft-n-max
     pub cache_reuse: Option<u32>,   // --cache-reuse N (prompt cache KV shifting)
     pub keep_loaded: Option<bool>,  // engine survives Argus restarts; identical relaunch is a no-op
+    /// 0.3.2 warm-up: system prompt of the current chat, processed once right after load (prompt cache)
+    #[serde(default)]
+    pub warmup_system: Option<String>,
+    /// vision projector: local path, "owner/repo/file.gguf" or a file in hf_repo (-hf fetches its own mmproj)
+    #[serde(default)] pub mmproj: Option<String>,
+    /// only local GPUs (no phones, no PC CPU layers)
+    #[serde(default)] pub gpu_only: Option<bool>,
+}
+
+/// 0.3.2: the split plan for a launch (roles + minimal node set + speed-first -ts).
+pub fn launch_plan(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -> crate::split::Plan {
+    let roles_on = snap.roles_enabled;
+    // header info from the snapshot cache only (filled by launch / plan_split): pure, no disk access
+    let model = match (&args.model_path, args.hf_file.as_deref().and_then(|f| f.rsplit(['/', '\\']).next())) {
+        (Some(p), _) => snap.gguf.get(p).cloned(),
+        (None, Some(base)) => snap.gguf.iter().find(|(k, _)| k.ends_with(base)).map(|(_, v)| v.clone()),
+        _ => None,
+    };
+    let opts = crate::split::PlanOpts {
+        gpu_only: args.gpu_only.unwrap_or(false), cpu: snap.cpu.dev(),
+        draft_mb: snap.draft.as_ref().map(|d| d.1).unwrap_or(0), model,
+    };
+    let mut p = crate::split::plan_ex(&snap.nodes, &snap.gpus, args.need_mb, &|n| crate::state::role_of(n, roles_on), &opts);
+    p.draft = snap.draft.is_some();
+    p.rpc_endpoints = plan_endpoints(&p, snap);
+    p
+}
+
+/// Local .gguf of a launch: model_path, or the -hf file already in the model cache.
+pub fn local_model_path(args: &StartModelArgs) -> Option<String> {
+    if let Some(p) = args.model_path.as_ref().filter(|p| !p.is_empty()) { return Some(p.clone()); }
+    let f = args.hf_file.as_deref().filter(|f| !f.is_empty())?;
+    let base = f.rsplit(['/', '\\']).next()?.to_string();
+    find_file(&model_cache_dir(), &base, 4).map(|p| p.display().to_string())
+}
+
+fn find_file(dir: &Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = vec![];
+    for e in rd.flatten() {
+        let p = e.path();
+        let fname = e.file_name().to_string_lossy().into_owned();
+        if p.is_dir() { subdirs.push(p); } else if fname == name || fname.ends_with(&format!("_{name}")) { return Some(p); }
+    }
+    if depth == 0 { return None; }
+    subdirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+}
+
+/// Draft model file when «Черновая модель» is on and the file exists.
+pub fn draft_file(s: &crate::settings::Settings) -> Option<std::path::PathBuf> {
+    if !s.draft_enabled { return None; }
+    if let Some(p) = s.draft_path.as_ref().filter(|p| !p.is_empty()) {
+        let p = std::path::PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let dir = model_cache_dir().join("draft");
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("gguf")).unwrap_or(false)).collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+/// GPU memory for the draft model (weights + its q8 KV), 0 when no draft.
+pub fn draft_mb(s: &crate::settings::Settings) -> u64 {
+    draft_file(s).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len() / 1_048_576 + 256).unwrap_or(0)
+}
+
+pub fn sessions_dir() -> std::path::PathBuf { model_cache_dir().join("sessions") }
+
+// ---------------------------------------------------------------- GGUF header
+
+/// Minimal GGUF reader: block_count / expert_count / expert_used_count + MB of expert tensors.
+pub fn gguf_info(path: &Path) -> Option<crate::split::ModelInfo> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+    let f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let mut r = BufReader::with_capacity(1 << 16, f);
+    fn u32_(r: &mut impl Read) -> Option<u32> { let mut b = [0u8; 4]; r.read_exact(&mut b).ok()?; Some(u32::from_le_bytes(b)) }
+    fn u64_(r: &mut impl Read) -> Option<u64> { let mut b = [0u8; 8]; r.read_exact(&mut b).ok()?; Some(u64::from_le_bytes(b)) }
+    fn str_(r: &mut impl Read) -> Option<String> {
+        let n = u64_(r)?; if n > 1 << 20 { return None; }
+        let mut b = vec![0u8; n as usize]; r.read_exact(&mut b).ok()?; Some(String::from_utf8_lossy(&b).into_owned())
+    }
+    fn fixed(t: u32) -> Option<i64> { Some(match t { 0 | 1 | 7 => 1, 2 | 3 => 2, 4 | 5 | 6 => 4, 10 | 11 | 12 => 8, _ => return None }) }
+    fn num<R: Read>(r: &mut R, t: u32) -> Option<u64> {
+        Some(match t {
+            0 | 1 | 7 => { let mut b = [0u8; 1]; r.read_exact(&mut b).ok()?; b[0] as u64 }
+            2 | 3 => { let mut b = [0u8; 2]; r.read_exact(&mut b).ok()?; u16::from_le_bytes(b) as u64 }
+            4 | 5 => u32_(r)? as u64,
+            6 => { u32_(r)?; 0 }
+            10 | 11 => u64_(r)?,
+            12 => { u64_(r)?; 0 }
+            _ => return None,
+        })
+    }
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" { return None; }
+    let ver = u32_(&mut r)?;
+    if ver < 2 { return None; }
+    let n_tensors = u64_(&mut r)?;
+    let n_kv = u64_(&mut r)?;
+    let mut ints: std::collections::HashMap<String, u64> = Default::default();
+    let mut arch = String::new();
+    for _ in 0..n_kv {
+        let key = str_(&mut r)?;
+        let t = u32_(&mut r)?;
+        match t {
+            8 => { let v = str_(&mut r)?; if key == "general.architecture" { arch = v; } }
+            9 => {
+                let it = u32_(&mut r)?;
+                let n = u64_(&mut r)?;
+                if let Some(sz) = fixed(it) { r.seek(SeekFrom::Current(sz * n as i64)).ok()?; }
+                else if it == 8 { for _ in 0..n { let l = u64_(&mut r)?; r.seek(SeekFrom::Current(l as i64)).ok()?; } }
+                else { return None; } // nested arrays: not in real models
+            }
+            _ => { let v = num(&mut r, t)?; ints.insert(key, v); }
+        }
+    }
+    let get = |k: &str| ints.get(&format!("{arch}.{k}")).copied().unwrap_or(0) as u32;
+    let align = ints.get("general.alignment").copied().filter(|a| *a > 0).unwrap_or(32);
+    // tensor infos: name, n_dims, dims, type, offset
+    let mut tensors: Vec<(bool, u64)> = Vec::with_capacity(n_tensors.min(100_000) as usize);
+    for _ in 0..n_tensors {
+        let name = str_(&mut r)?;
+        let nd = u32_(&mut r)?;
+        if nd > 8 { return None; }
+        for _ in 0..nd { u64_(&mut r)?; }
+        u32_(&mut r)?;
+        let off = u64_(&mut r)?;
+        tensors.push((name.contains("_exps"), off));
+    }
+    let pos = r.stream_position().ok()?;
+    let data_start = pos.div_ceil(align) * align;
+    let mut order: Vec<usize> = (0..tensors.len()).collect();
+    order.sort_by_key(|&i| tensors[i].1);
+    let data_len = file_len.saturating_sub(data_start);
+    let mut experts = 0u64;
+    for (k, &i) in order.iter().enumerate() {
+        let end = order.get(k + 1).map(|&j| tensors[j].1).unwrap_or(data_len);
+        if tensors[i].0 { experts += end.saturating_sub(tensors[i].1); }
+    }
+    Some(crate::split::ModelInfo {
+        block_count: get("block_count"), expert_count: get("expert_count"), expert_used: get("expert_used_count"),
+        experts_mb: experts / 1_048_576, weights_mb: data_len / 1_048_576,
+    })
+}
+
+/// `--rpc` endpoints of a plan, in order.
+pub fn plan_endpoints(plan: &crate::split::Plan, snap: &crate::state::ClusterSnapshot) -> Vec<String> {
+    plan.rpc_ids.iter().filter_map(|id| snap.nodes.iter().find(|n| &n.id == id).and_then(|n| n.endpoint.clone())).collect()
 }
 
 /// Builds the llama-server argument list (pure; unit-tested).
@@ -58,18 +213,25 @@ pub fn build_args(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -
     push(&["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"]);   // q8 KV cache: half the memory, ~no quality loss
 
     // ---- devices: --rpc first (registers RPC0..), then --device in the same order as -ts
-    let plan = crate::split::plan(&snap.nodes, &snap.gpus, args.need_mb);
-    if !snap.rpc_servers.is_empty() { push(&["--rpc", &snap.rpc_servers.join(",")]); }
+    let full = launch_plan(args, snap);
+    let rpc = plan_endpoints(&full, snap);
+    let devices = crate::split::device_list(&full);
+    if !rpc.is_empty() { push(&["--rpc", &rpc.join(",")]); }
     let local_gpu = snap.gpus.iter().find(|g| g.enabled && g.device.is_some()).and_then(|g| g.device.clone());
     if !snap.gpus.is_empty() {
         // llama.cpp's device list is known: always pass it explicitly so -ts lines up and disabled GPUs stay idle
-        if plan.is_empty() {
+        if devices.is_empty() {
             push(&["--device", "none"]); // every device disabled: CPU only
         } else {
-            let devs = plan.iter().map(|e| e.device.as_str()).collect::<Vec<_>>().join(",");
-            push(&["--device", &devs]);
-            if plan.len() > 1 { push(&["-ts", &crate::split::ts_arg(&plan)]); }
-            push(&["-ngl", "999"]);
+            push(&["--device", &devices.join(",")]);
+            if devices.len() > 1 { push(&["-ts", &crate::split::ts_for_plan(&full)]); }
+            // CPU pseudo-node: the FIRST cpu_layers layers stay on the PC CPU (-ngl < n_layer + 1)
+            match full.n_layers.filter(|_| full.cpu_layers > 0 && full.moe.is_none()) {
+                Some(nl) => push(&["-ngl", &(nl + 1).saturating_sub(full.cpu_layers).max(1).to_string()]),
+                None => push(&["-ngl", "999"]),
+            }
+            // MoE: expert tensors of the offloaded blocks → rpc buffers / CPU (after --rpc)
+            if let Some(ot) = crate::split::ot_arg(&full, &rpc) { push(&["-ot", &ot]); }
             // vision projector would default to the first device (an RPC phone): keep it on the local GPU
             match &local_gpu {
                 Some(g) => push(&["-mmdev", g]),
@@ -82,9 +244,21 @@ pub fn build_args(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -
     }
     // else CPU-only host: leave -ngl unset so llama.cpp --fit spreads layers over RPC nodes + host RAM
 
+    if let Some(t) = full.threads { push(&["-t", &t.to_string()]); }
+    // chat sessions: POST /slots/0?action=save|restore
+    push(&["--slot-save-path", &sessions_dir().display().to_string()]);
+
     // ---- speed
     if let Some(n) = args.cache_reuse.filter(|n| *n > 0) { push(&["--cache-reuse", &n.to_string()]); }
-    if let Some(d) = args.draft_hf.as_deref().filter(|d| !d.is_empty()) {
+    if let Some((d, _)) = snap.draft.as_ref() {
+        // local draft model (settings «Черновая модель»): on the local GPU, q8 KV
+        push(&["-md", d, "--spec-type", "draft-simple", "--spec-draft-n-max", "8", "--spec-draft-n-min", "2"]);
+        match &local_gpu {
+            Some(g) => push(&["-devd", g, "-ngld", "99"]),
+            None => push(&["-devd", "none"]),
+        }
+        push(&["-ctkd", "q8_0", "-ctvd", "q8_0"]);
+    } else if let Some(d) = args.draft_hf.as_deref().filter(|d| !d.is_empty()) {
         push(&["-hfd", d, "--spec-type", "draft-simple"]);
         push(&["--spec-draft-n-max", &args.draft_max.unwrap_or(16).to_string(), "--spec-draft-n-min", "1"]);
         // the draft is small: keep it entirely on the local GPU (or CPU) — never on a phone over USB
@@ -93,6 +267,7 @@ pub fn build_args(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -
             None => push(&["-devd", "none"]),
         }
     }
+    a.extend(crate::vision::mmproj_args(args.mmproj.as_deref(), args.hf_repo.as_deref()));
     Ok(a)
 }
 
@@ -271,10 +446,17 @@ pub async fn stop_for_update(st: &AppState) {
 
 async fn launch(app: &AppHandle, st: &Arc<AppState>, args: StartModelArgs, auto: bool) -> Result<String, String> {
     let _guard = st.launch_lock.lock().await;
+    // GGUF header (layers / experts) for the plan: cached by path
+    if let Some(p) = local_model_path(&args) { let _ = st.model_info(&p).await; }
     let snap = st.snapshot().await;
-    let rpc = snap.rpc_servers.join(",");
+    let plan = launch_plan(&args, &snap);
+    let rpc = plan_endpoints(&plan, &snap).join(",");
     let sig = serde_json::to_string(&(&args.hf_repo, &args.hf_file, &args.model_path, &args.ctx, &args.lan,
-        &args.draft_hf, &args.cache_reuse, &rpc, snap.split.iter().map(|e| &e.device).collect::<Vec<_>>())).unwrap_or_default();
+        &args.draft_hf, &args.cache_reuse, &rpc, plan.entries.iter().map(|e| (&e.device, (e.share * 1000.0).round() as u32)).collect::<Vec<_>>(),
+        (plan.cpu_layers, plan.threads, plan.draft, plan.moe.as_ref().map(|m| m.gpu_blocks.len()), &args.gpu_only))).unwrap_or_default();
+    if plan.cpu_layers > 0 { let _ = app.emit("llama-log", format!("[argus] {} слоёв на процессоре ПК ({} потоков)", plan.cpu_layers, plan.threads.unwrap_or(0))); }
+    if let Some(m) = &plan.moe { let _ = app.emit("llama-log", format!("[argus] MoE: внимание и KV на GPU, эксперты {} блоков вынесены", m.block_count as usize - m.gpu_blocks.len())); }
+    let _ = std::fs::create_dir_all(sessions_dir());
     // keep-loaded: the identical engine is already up -> nothing to do
     if !auto && args.keep_loaded.unwrap_or(false) && engine_running(st).await
         && st.engine_sig.lock().await.as_deref() == Some(sig.as_str()) {
@@ -283,8 +465,14 @@ async fn launch(app: &AppHandle, st: &Arc<AppState>, args: StartModelArgs, auto:
     }
     kill_engine(st).await;
 
-    let used: Vec<EngineNode> = snap.nodes.iter().filter(|n| n.online() && n.enabled)
+    // only the nodes the plan needs (0.3.2): «Свободна» / «Помощник» nodes stay out of --rpc
+    let used: Vec<EngineNode> = plan.rpc_ids.iter().filter_map(|id| snap.nodes.iter().find(|n| &n.id == id))
         .filter_map(|n| n.endpoint.clone().map(|ep| EngineNode { id: n.id.clone(), name: n.name.clone(), endpoint: ep })).collect();
+    if !plan.free_ids.is_empty() {
+        let names: Vec<String> = plan.free_ids.iter().filter_map(|id| snap.nodes.iter().find(|n| &n.id == id).map(|n| n.name.clone())).collect();
+        let _ = app.emit("llama-log", format!("[argus] модель помещается без: {} — они свободны", names.join(", ")));
+    }
+    if let Some(t) = plan.est_tps { let _ = app.emit("llama-log", format!("[argus] оценка скорости: ≈{t:.1} ток/с")); }
     {
         let mut s = st.settings.lock().await;
         s.keep_loaded = args.keep_loaded.unwrap_or(false);
@@ -352,15 +540,26 @@ async fn launch(app: &AppHandle, st: &Arc<AppState>, args: StartModelArgs, auto:
         });
     }
     // llama.cpp only draws download progress on a TTY, so report bytes landing in the cache instead.
+    // One counter at a time: a newer launch bumps DL_GEN so the previous loop exits (no duplicate counters);
+    // an automatic restart keeps the previous base so the shown downloaded amount does not jump back to 0.
     {
+        use std::sync::atomic::Ordering;
+        let gen = DL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         let app2 = app.clone();
         let cache = model_cache_dir();
         tauri::async_runtime::spawn(async move {
-            let start = dir_size(&cache);
-            let mut last = start; let mut still = 0;
+            let c2 = cache.clone();
+            let now0 = tokio::task::spawn_blocking(move || dir_size(&c2)).await.unwrap_or(0);
+            let prev = DL_BASE.load(Ordering::SeqCst);
+            let start = if auto && prev != u64::MAX && prev <= now0 { prev } else { now0 };
+            DL_BASE.store(start, Ordering::SeqCst);
+            let mut last = now0; let mut still = 0;
             loop {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
-                let now = dir_size(&cache);
+                if DL_GEN.load(Ordering::SeqCst) != gen { break; }
+                let c2 = cache.clone();
+                let now = tokio::task::spawn_blocking(move || dir_size(&c2)).await.unwrap_or(last);
+                if DL_GEN.load(Ordering::SeqCst) != gen { break; }
                 if now != last { still = 0; let _ = app2.emit("llama-dl", now.saturating_sub(start)); } else { still += 1; }
                 last = now;
                 if still > 20 { break; } // nothing written for 20 s: download done (or cached)
@@ -382,6 +581,7 @@ async fn launch(app: &AppHandle, st: &Arc<AppState>, args: StartModelArgs, auto:
         e.last_err = None;
         e.new_nodes = false;
         e.restarting = auto;
+        e.warming = false;
         if !auto { e.restarts.clear(); }
     }
     emit_engine(app, st.engine_view().await, None);
@@ -449,9 +649,12 @@ pub async fn supervise(app: &AppHandle, st: &Arc<AppState>) {
                 emit_engine(app, v, Some(&format!("Нода {who} отключилась — генерация остановлена")));
                 return;
             }
+            // «новая нода»: the plan for this model would now use a node the engine doesn't have
             let used: HashSet<String> = e.nodes.iter().map(|x| x.endpoint.clone()).collect();
-            e.new_nodes = snap.nodes.iter().any(|n| n.online() && n.enabled && n.endpoint.as_ref()
-                .map(|ep| !used.contains(ep)).unwrap_or(false));
+            e.new_nodes = match e.args.as_ref() {
+                Some(a) => plan_endpoints(&launch_plan(a, &snap), &snap).iter().any(|ep| !used.contains(ep)),
+                None => false,
+            };
             if e.status == EngineStatus::Loading {
                 let due = e.last_health_check.map(|t| t.elapsed() >= Duration::from_millis(900)).unwrap_or(true);
                 if due {
@@ -462,10 +665,14 @@ pub async fn supervise(app: &AppHandle, st: &Arc<AppState>) {
                         if e.status == EngineStatus::Loading {
                             e.status = EngineStatus::Ready;
                             e.ever_healthy = true;
+                            e.warming = true;
+                            let system = e.args.as_ref().and_then(|a| a.warmup_system.clone());
                             let auto = std::mem::take(&mut e.restarting);
                             drop(e);
                             let v = st.engine_view().await;
                             emit_engine(app, v, auto.then_some("Кластер изменился — модель перезапущена"));
+                            let (app2, st2) = (app.clone(), st.clone());
+                            tauri::async_runtime::spawn(async move { warmup(&app2, &st2, system).await });
                         }
                     }
                 }
@@ -515,6 +722,120 @@ pub async fn supervise(app: &AppHandle, st: &Arc<AppState>) {
             }
         }
     }
+}
+
+/// 0.3.2 «Прогрев»: right after load, one tiny generation (1 token) with the chat's system prompt.
+/// The first real request then finds the weights paged in, the compute graphs/buffers allocated on every node
+/// and the system prompt already in the KV cache (llama-server keeps the slot's prompt), so it starts at once.
+async fn warmup(app: &AppHandle, st: &Arc<AppState>, system: Option<String>) {
+    let t0 = Instant::now();
+    let mut messages = vec![];
+    if let Some(sys) = system.filter(|s| !s.trim().is_empty()) { messages.push(serde_json::json!({ "role": "system", "content": sys })); }
+    messages.push(serde_json::json!({ "role": "user", "content": "Привет" }));
+    let body = serde_json::json!({ "messages": messages, "max_tokens": 1, "temperature": 0, "cache_prompt": true,
+                                   "chat_template_kwargs": { "enable_thinking": false } });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_default();
+    let r = client.post(format!("http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions")).json(&body)
+        .timeout(Duration::from_secs(180)).send().await;
+    let msg = match r {
+        Ok(x) if x.status().is_success() => format!("[argus] прогрев готов за {:.1} с", t0.elapsed().as_secs_f32()),
+        Ok(x) => format!("[argus] прогрев: HTTP {} — не страшно, просто первый ответ будет медленнее", x.status()),
+        Err(e) => format!("[argus] прогрев не удался ({e}) — первый ответ будет медленнее"),
+    };
+    let _ = app.emit("llama-log", msg);
+    st.engine_state.lock().await.warming = false;
+    let v = st.engine_view().await;
+    emit_engine(app, v, None);
+}
+
+/// 0.3.2: split preview for a model size (Models: which nodes would work, which stay free, ≈ tok/s).
+#[tauri::command]
+pub async fn plan_split(state: State<'_, Arc<AppState>>, need_mb: Option<u64>, model_path: Option<String>,
+                        gpu_only: Option<bool>) -> Result<crate::split::Plan, String> {
+    let args = StartModelArgs { need_mb, model_path: model_path.filter(|p| !p.is_empty()), gpu_only, ..Default::default() };
+    if let Some(p) = local_model_path(&args) { let _ = state.model_info(&p).await; }
+    let snap = state.snapshot().await;
+    Ok(launch_plan(&args, &snap))
+}
+
+// ---------------------------------------------------------------- chat sessions (KV save/restore)
+
+fn session_file(chat_id: &str) -> Result<String, String> {
+    let id: String = chat_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+    if id.is_empty() { return Err("пустой id чата".into()); }
+    Ok(format!("{id}.bin"))
+}
+
+async fn slot_action(action: &str, file: &str) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::builder().no_proxy().build().map_err(|e| e.to_string())?;
+    client.post(format!("http://127.0.0.1:{LLAMA_PORT}/slots/0?action={action}"))
+        .json(&serde_json::json!({ "filename": file })).timeout(Duration::from_secs(120)).send().await
+        .map_err(|e| format!("движок не отвечает: {e}"))
+}
+
+/// Keep at most `keep` newest session files.
+fn prune_sessions(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut v: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd.flatten()
+        .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in v.into_iter().skip(keep) { let _ = std::fs::remove_file(p); }
+}
+
+/// Saves the slot KV cache of the current chat to <models>/sessions/<chatId>.bin (≤ 12 files kept).
+#[tauri::command]
+pub async fn save_chat_session(chat_id: String) -> Result<String, String> {
+    let file = session_file(&chat_id)?;
+    let _ = std::fs::create_dir_all(sessions_dir());
+    let r = slot_action("save", &file).await?;
+    if !r.status().is_success() {
+        let t = r.text().await.unwrap_or_default();
+        return Err(format!("сохранение сессии: {}", t.chars().take(200).collect::<String>()));
+    }
+    prune_sessions(&sessions_dir(), 12);
+    Ok(file)
+}
+
+/// Restores a saved chat KV cache; false when this chat has no saved session.
+#[tauri::command]
+pub async fn restore_chat_session(chat_id: String) -> Result<bool, String> {
+    let file = session_file(&chat_id)?;
+    let path = sessions_dir().join(&file);
+    if !path.is_file() { return Ok(false); }
+    let r = slot_action("restore", &file).await?;
+    if !r.status().is_success() {
+        let t = r.text().await.unwrap_or_default();
+        return Err(format!("восстановление сессии: {}", t.chars().take(200).collect::<String>()));
+    }
+    // touch: recently used sessions survive pruning
+    let _ = std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Ok(true)
+}
+
+/// «Черновая модель» (speculative decoding) on/off; optional local .gguf path. Applies at the next model start.
+#[tauri::command]
+pub async fn set_draft_enabled(state: State<'_, Arc<AppState>>, enabled: bool, path: Option<String>) -> Result<(), String> {
+    {
+        let mut s = state.settings.lock().await;
+        s.draft_enabled = enabled;
+        if let Some(p) = path { s.draft_path = Some(p).filter(|p| !p.trim().is_empty()); }
+    }
+    state.save_settings().await;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftStatus { pub enabled: bool, pub path: Option<String>, pub present: bool, pub size_mb: u64 }
+
+#[tauri::command]
+pub async fn get_draft_status(state: State<'_, Arc<AppState>>) -> Result<DraftStatus, String> {
+    let s = state.settings.lock().await.clone();
+    let on = crate::settings::Settings { draft_enabled: true, ..s.clone() };
+    let f = draft_file(&on);
+    let size_mb = f.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len() / 1_048_576).unwrap_or(0);
+    Ok(DraftStatus { enabled: s.draft_enabled, path: f.map(|p| p.display().to_string()).or(s.draft_path), present: size_mb > 0, size_mb })
 }
 
 // ---------------------------------------------------------------- commands

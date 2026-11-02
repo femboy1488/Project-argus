@@ -1,13 +1,10 @@
 # Free GitHub Actions build: Android rpc-server -> node.apk -> Windows installer + Linux AppImage/.deb with everything bundled.
 # Push this repo to GitHub, open Actions, run "build" — artifacts appear on the run page.
-# Manual run on a vX.Y.Z tag with publish=true additionally publishes a GitHub Release with
+# Tag push vX.Y.Z (e.g. `git tag v0.3.1 && git push --tags`) additionally publishes a GitHub Release with
 # Argus-Setup.exe, Argus-Node.apk, the Linux AppImage/.deb and SHA256SUMS.txt — the files Argus' updater
 # looks for (it refuses an update without SHA256SUMS.txt). The tag must match the app version.
 name: build
-on:
-  workflow_dispatch:
-    inputs:
-      publish: { description: "Publish GitHub Release (run on a v* tag; APK must be signed with the release key)", type: boolean, default: false }
+on: { workflow_dispatch: {}, push: { tags: ["v*"] } }
 permissions: { contents: write }   # softprops/action-gh-release
 
 env:
@@ -159,7 +156,7 @@ jobs:
 
   # Tag push vX.Y.Z -> GitHub Release with every asset + SHA256SUMS.txt (Argus' updater requires the checksums).
   release:
-    if: inputs.publish && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [node-apk, desktop-windows, desktop-linux]
     runs-on: ubuntu-latest
     steps:

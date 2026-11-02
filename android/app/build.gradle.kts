@@ -10,8 +10,8 @@ android {
         applicationId = "com.harkcluster.node"
         minSdk = 28
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.1"
+        versionCode = 7
+        versionName = "0.3.3"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
     buildTypes { release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("debug") } }
