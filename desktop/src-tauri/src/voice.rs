@@ -1,5 +1,5 @@
 //! Speech-to-text through a whisper.cpp server (`/inference`, multipart).
-//! Base URL: the one given by the UI (features → voice url), else a whisper service on a USB phone (nodesvc).
+//! Base URL: the one given by the UI (features → voice url), else a whisper service on a phone (nodesvc: USB forward or Wi-Fi IP).
 
 use base64::Engine;
 use std::time::Duration;

@@ -275,6 +275,7 @@ function Inspector({ node, snap }: { node: ClusterNode; snap: ClusterSnapshot })
   if (node.attempts > 0) rows.push(["Failed attempts", String(node.attempts)]);
   if (node.speed > 0) rows.push(["Скорость", `${node.speed.toFixed(1)} ГБ/с · ${node.speedMeasured ? "замер" : "оценка"}`]);
   if (node.rttMs != null) rows.push(["RTT", `${node.rttMs.toFixed(1)} мс`]);
+  if (node.tempC != null) rows.push(["Температура", `${node.tempC.toFixed(0)} °C${node.throttled ? " · греется, сбавляет скорость" : ""}`]);
   if (node.transport !== "local" && node.assigned) rows.push(["Сейчас", node.assigned === "model" ? "часть модели" : node.assigned === "free" ? "свободна" : node.assigned === "helper" ? "помощник" : "выключена / не в сети"]);
   return (
     <aside className="flex flex-col overflow-y-auto bg-pl-bg1">

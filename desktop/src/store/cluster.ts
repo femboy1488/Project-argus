@@ -42,7 +42,7 @@ function persist(convs: Conversation[], active: string) {
   }, 300);
 }
 
-const defaultSpeed: SpeedSettings = { speculative: false, draft: "auto", draftMax: 16, promptCache: true, keepLoaded: true, fastStart: true };
+const defaultSpeed: SpeedSettings = { draftMax: 16, gpuOnly: false, promptCache: true, keepLoaded: true, fastStart: true };
 
 interface State {
   view: View;

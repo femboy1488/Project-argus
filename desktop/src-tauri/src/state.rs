@@ -501,17 +501,14 @@ impl AppState {
         let cpu = self.cpu.lock().await.clone();
         let last = self.engine_state.lock().await.args.clone().or_else(|| settings.last_launch.clone());
         // header info only from the cache (filled by launch / plan_split): no disk walk every second
-        let model = last.as_ref().and_then(|a| {
-            let cache = self.gguf_cache.try_lock().ok()?;
-            match (&a.model_path, a.hf_file.as_deref().and_then(|f| f.rsplit(['/', '\\']).next())) {
-                (Some(p), _) => cache.get(p).map(|x| x.1.clone()),
-                (None, Some(base)) => cache.iter().find(|(k, _)| k.ends_with(base)).map(|(_, v)| v.1.clone()),
-                _ => None,
-            }
-        });
+        let gguf: HashMap<String, split::ModelInfo> = self.gguf_cache.lock().await.iter().map(|(k, v)| (k.clone(), v.1.clone())).collect();
+        let model = last.as_ref().and_then(|a| crate::llama::model_for(a, &gguf));
+        // draft of the running / last model (settings.draft_enabled + its family): same reservation as the launch
+        let draft = crate::llama::draft_reserve(&settings, last.as_ref(), model.as_ref());
         let opts = split::PlanOpts { gpu_only: last.as_ref().and_then(|a| a.gpu_only).unwrap_or(false), cpu: cpu.dev(),
-                                     draft_mb: crate::llama::draft_mb(&settings), model };
-        let plan = split::plan_ex(&nodes, &gpus, need_mb, &|n: &Node| role_of(n, roles_on), &opts);
+                                     draft_mb: draft.as_ref().map(|d| d.1).unwrap_or(0), model };
+        let mut plan = split::plan_ex(&nodes, &gpus, need_mb, &|n: &Node| role_of(n, roles_on), &opts);
+        plan.draft = draft.is_some();
         let rpc_servers: Vec<String> = plan.rpc_ids.iter()
             .filter_map(|id| nodes.iter().find(|n| &n.id == id).and_then(|n| n.endpoint.clone())).collect();
         let helpers_rt = self.helpers.lock().await;
@@ -545,8 +542,7 @@ impl AppState {
                           roles_enabled: roles_on, helper_model: crate::helper::model_id(&settings.helper_model).to_string(),
                           helper_models: crate::helper::model_views(), helpers,
                           cpu, plan, draft_enabled: settings.draft_enabled,
-                          gguf: self.gguf_cache.lock().await.iter().map(|(k, v)| (k.clone(), v.1.clone())).collect(),
-                          draft: crate::llama::draft_file(&settings).map(|p| (p.display().to_string(), crate::llama::draft_mb(&settings))) }
+                          gguf, draft }
     }
 }
 

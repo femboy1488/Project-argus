@@ -27,6 +27,8 @@ pub struct Discovered {
     /// optional thermal state (node 0.3.3+): °C and throttling flag
     pub temp_c: Option<f32>,
     pub throttled: Option<bool>,
+    /// node 0.3.3+: `roles` map {helper,voice,library:{state,port,pct,threads,model|zim,error}} (Roles.json() on the phone)
+    pub roles: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -56,6 +58,7 @@ struct Beacon {
     #[serde(default)] helper: Option<BeaconHelper>,
     #[serde(default)] temp_c: Option<f32>,
     #[serde(default)] throttled: Option<bool>,
+    #[serde(default)] roles: Option<serde_json::Value>,
 }
 
 /// {"argus":"node","v":1,"name":"<model>","port":50052,"ram_mb":N,"free_mb":N,"variant":"dotprod","vn":"0.3.1","vc":5}
@@ -73,6 +76,7 @@ pub fn parse_beacon(bytes: &[u8], src: IpAddr) -> Option<Discovered> {
         src_port: 0, vn: b.vn.map(|v| v.chars().filter(|c| !c.is_control()).take(24).collect()), vc: b.vc,
         bench: b.bench.filter(|g| g.is_finite() && *g > 0.0 && *g < 1000.0),
         temp_c: b.temp_c.filter(|t| t.is_finite() && *t > -40.0 && *t < 150.0), throttled: b.throttled,
+        roles: b.roles.filter(|r| r.is_object()),
         helper: b.helper.map(|mut h| { h.error = h.error.map(|e| e.chars().filter(|c| !c.is_control()).take(200).collect()); h }),
     })
 }
@@ -114,5 +118,8 @@ mod tests {
         assert_eq!(d.helper.as_ref().map(|h| (h.state.as_str(), h.pct)), Some(("downloading", Some(40))));
         let r: serde_json::Value = serde_json::from_slice(&host_reply(50055, Some(6), false, Some(serde_json::Value::Bool(false)))).unwrap();
         assert_eq!(r["helper"], serde_json::Value::Bool(false));
+        let d = parse_beacon(br#"{"argus":"node","v":1,"roles":{"voice":{"state":"ready","port":50061,"threads":2},"library":{"state":"idle","port":50063}}}"#, ip).unwrap();
+        assert_eq!(d.roles.as_ref().and_then(|r| r["voice"]["state"].as_str()), Some("ready"));
+        assert!(parse_beacon(br#"{"argus":"node","v":1,"roles":5}"#, ip).unwrap().roles.is_none());
     }
 }

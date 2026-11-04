@@ -32,8 +32,7 @@ pub struct StartModelArgs {
     pub alias: Option<String>,      // model id other apps see in GET /v1/models
     pub lan: Option<bool>,          // bind 0.0.0.0 so other machines (or a VM/WSL) can use the API
     pub need_mb: Option<u64>,       // estimated weights+KV, lets the split water-fill fast devices first
-    // speed options
-    pub draft_hf: Option<String>,   // speculative decoding draft model, "repo:quant" -> -hfd
+    // speed options (the draft model itself is picked by Rust: settings.draft_enabled + model family)
     pub draft_max: Option<u32>,     // --spec-draft-n-max
     pub cache_reuse: Option<u32>,   // --cache-reuse N (prompt cache KV shifting)
     pub keep_loaded: Option<bool>,  // engine survives Argus restarts; identical relaunch is a no-op
@@ -44,17 +43,15 @@ pub struct StartModelArgs {
     #[serde(default)] pub mmproj: Option<String>,
     /// only local GPUs (no phones, no PC CPU layers)
     #[serde(default)] pub gpu_only: Option<bool>,
+    /// local .gguf of the main model resolved by Argus (model_path, or the -hf file in the model cache)
+    #[serde(default)] pub local_path: Option<String>,
 }
 
 /// 0.3.2: the split plan for a launch (roles + minimal node set + speed-first -ts).
 pub fn launch_plan(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -> crate::split::Plan {
     let roles_on = snap.roles_enabled;
     // header info from the snapshot cache only (filled by launch / plan_split): pure, no disk access
-    let model = match (&args.model_path, args.hf_file.as_deref().and_then(|f| f.rsplit(['/', '\\']).next())) {
-        (Some(p), _) => snap.gguf.get(p).cloned(),
-        (None, Some(base)) => snap.gguf.iter().find(|(k, _)| k.ends_with(base)).map(|(_, v)| v.clone()),
-        _ => None,
-    };
+    let model = model_for(args, &snap.gguf);
     let opts = crate::split::PlanOpts {
         gpu_only: args.gpu_only.unwrap_or(false), cpu: snap.cpu.dev(),
         draft_mb: snap.draft.as_ref().map(|d| d.1).unwrap_or(0), model,
@@ -65,43 +62,223 @@ pub fn launch_plan(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) 
     p
 }
 
-/// Local .gguf of a launch: model_path, or the -hf file already in the model cache.
+/// Local .gguf of a launch: local_path / model_path, or the -hf file already in the model cache
+/// (`--hf-file` name, or for "owner/repo:QUANT" the cached file of that repo with that quant).
 pub fn local_model_path(args: &StartModelArgs) -> Option<String> {
     if let Some(p) = args.model_path.as_ref().filter(|p| !p.is_empty()) { return Some(p.clone()); }
-    let f = args.hf_file.as_deref().filter(|f| !f.is_empty())?;
-    let base = f.rsplit(['/', '\\']).next()?.to_string();
-    find_file(&model_cache_dir(), &base, 4).map(|p| p.display().to_string())
+    if let Some(p) = args.local_path.as_ref().filter(|p| !p.is_empty() && Path::new(p.as_str()).is_file()) { return Some(p.clone()); }
+    let cache = model_cache_dir();
+    if let Some(f) = args.hf_file.as_deref().filter(|f| !f.is_empty()) {
+        let base = f.rsplit(['/', '\\']).next()?.to_string();
+        return find_file(&cache, &base, 4).map(|p| p.display().to_string());
+    }
+    // "owner/repo:QUANT": llama.cpp keeps it as models--owner--repo/…/<file> or owner_repo_<file>
+    let (repo, quant) = args.hf_repo.as_deref()?.split_once(':')?;
+    let repo_l = repo.rsplit('/').next()?.to_lowercase();
+    let quant_l = quant.to_lowercase();
+    if repo_l.is_empty() || quant_l.is_empty() { return None; }
+    walk_find(&cache, 5, &|p: &Path| {
+        let full = p.to_string_lossy().to_lowercase();
+        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        name.ends_with(".gguf") && full.contains(&repo_l) && name.contains(&quant_l) && !name.contains("mmproj")
+            && (!name.contains("-of-") || name.contains("00001-of-"))
+    }).map(|p| p.display().to_string())
 }
 
 fn find_file(dir: &Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
+    walk_find(dir, depth, &|p: &Path| {
+        let fname = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        fname == name || fname.ends_with(&format!("_{name}"))
+    })
+}
+
+/// First file (files of a folder before its subfolders) matching `pred`; skips the draft and sessions folders.
+fn walk_find(dir: &Path, depth: u32, pred: &dyn Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut subdirs = vec![];
     for e in rd.flatten() {
         let p = e.path();
-        let fname = e.file_name().to_string_lossy().into_owned();
-        if p.is_dir() { subdirs.push(p); } else if fname == name || fname.ends_with(&format!("_{name}")) { return Some(p); }
+        if p.is_dir() {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            if n != "draft" && n != "sessions" { subdirs.push(p); }
+        } else if pred(&p) { return Some(p); }
     }
     if depth == 0 { return None; }
-    subdirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+    subdirs.sort();
+    subdirs.into_iter().find_map(|d| walk_find(&d, depth - 1, pred))
 }
 
-/// Draft model file when «Черновая модель» is on and the file exists.
-pub fn draft_file(s: &crate::settings::Settings) -> Option<std::path::PathBuf> {
-    if !s.draft_enabled { return None; }
-    if let Some(p) = s.draft_path.as_ref().filter(|p| !p.is_empty()) {
-        let p = std::path::PathBuf::from(p);
-        return p.is_file().then_some(p);
+/// GGUF header of a launch's main model from a path -> info map (the snapshot cache).
+pub fn model_for(args: &StartModelArgs, gguf: &std::collections::HashMap<String, crate::split::ModelInfo>) -> Option<crate::split::ModelInfo> {
+    for p in [&args.model_path, &args.local_path].into_iter().flatten() {
+        if let Some(m) = gguf.get(p) { return Some(m.clone()); }
     }
-    let dir = model_cache_dir().join("draft");
-    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("gguf")).unwrap_or(false)).collect();
-    v.sort();
-    v.into_iter().next()
+    let base = args.hf_file.as_deref().and_then(|f| f.rsplit(['/', '\\']).next()).filter(|b| !b.is_empty())?;
+    gguf.iter().find(|(k, _)| k.ends_with(base)).map(|(_, v)| v.clone())
 }
 
-/// GPU memory for the draft model (weights + its q8 KV), 0 when no draft.
-pub fn draft_mb(s: &crate::settings::Settings) -> u64 {
-    draft_file(s).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len() / 1_048_576 + 256).unwrap_or(0)
+// ---------------------------------------------------------------- draft model («Ускорение черновиком»)
+//
+// One source of truth: settings.draft_enabled (set_draft_enabled). The draft is picked here by the main
+// model's family (same vocabulary), lives in <models>/draft/ and is downloaded on the first launch that
+// needs it. A hand-picked settings.draft_path wins over the family draft.
+
+/// Small same-family models (verified on Hugging Face; sizes are exact).
+#[derive(Debug)]
+pub struct DraftModel { pub family: &'static str, pub name: &'static str, pub repo: &'static str, pub file: &'static str, pub size: u64 }
+
+pub const DRAFTS: &[DraftModel] = &[
+    DraftModel { family: "qwen3", name: "Qwen3 0.6B", repo: "unsloth/Qwen3-0.6B-GGUF", file: "Qwen3-0.6B-Q4_0.gguf", size: 382_156_480 },
+    DraftModel { family: "llama3", name: "Llama 3.2 1B", repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", size: 807_694_464 },
+    DraftModel { family: "gemma2", name: "Gemma 2 2B", repo: "bartowski/gemma-2-2b-it-GGUF", file: "gemma-2-2b-it-Q4_K_M.gguf", size: 1_708_582_752 },
+];
+
+pub fn draft_dir() -> std::path::PathBuf { model_cache_dir().join("draft") }
+
+/// Family of a GGUF architecture (+ vocabulary size), None = unknown / no draft for it.
+fn arch_family(arch: &str, n_vocab: u32) -> Option<&'static str> {
+    match arch {
+        "qwen3" | "qwen3moe" => Some("qwen3"),
+        "llama" if n_vocab == 0 || (128_000..=128_512).contains(&n_vocab) => Some("llama3"),
+        "gemma2" => Some("gemma2"),
+        _ => None,
+    }
+}
+
+/// Draft family of the main model: from its GGUF header when known, else from its name.
+/// None for vision launches (llama-server can't combine a projector with speculative decoding),
+/// for the small models that are drafts themselves and for families without a draft.
+pub fn model_family(args: &StartModelArgs, info: Option<&crate::split::ModelInfo>) -> Option<&'static str> {
+    if args.mmproj.as_deref().map(|m| !m.is_empty()).unwrap_or(false) { return None; }
+    let n = [&args.hf_repo, &args.hf_file, &args.model_path, &args.local_path, &args.alias].into_iter().flatten()
+        .map(|s| s.to_lowercase()).collect::<Vec<_>>().join(" ");
+    if n.contains("-vl") || n.contains("vision") || n.contains("mmproj") { return None; }
+    let fam = match info.filter(|i| !i.arch.is_empty()) {
+        Some(i) => arch_family(&i.arch, i.n_vocab)?,
+        None if n.contains("qwen3") => "qwen3",
+        None if n.contains("llama-3") || n.contains("llama3") || n.contains("hermes-3") => "llama3",
+        None if n.contains("gemma-2-") || n.contains("gemma2") => "gemma2",
+        None => return None,
+    };
+    let is_draft_itself = match fam {
+        "qwen3" => n.contains("0.6b"),
+        "llama3" => n.contains("-1b") || n.contains("_1b"),
+        _ => n.contains("gemma-2-2b") || n.contains("gemma2-2b"),
+    };
+    (!is_draft_itself).then_some(fam)
+}
+
+/// What the draft for a launch would be (no disk writes).
+#[derive(Debug, Clone)]
+pub struct DraftPick {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    /// the file is already there
+    pub present: bool,
+    /// GPU memory reserved for it: weights + q8 KV
+    pub mb: u64,
+    /// family draft that can be downloaded (None = hand-picked file)
+    pub model: Option<&'static DraftModel>,
+}
+
+/// Draft for these launch args, regardless of the on/off switch (callers check settings.draft_enabled).
+pub fn draft_pick(s: &crate::settings::Settings, args: &StartModelArgs, info: Option<&crate::split::ModelInfo>) -> Option<DraftPick> {
+    if let Some(p) = s.draft_path.as_ref().filter(|p| !p.trim().is_empty()) {
+        let path = std::path::PathBuf::from(p.trim());
+        let len = std::fs::metadata(&path).ok().filter(|m| m.is_file()).map(|m| m.len()).unwrap_or(0);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+        return Some(DraftPick { path, name, present: len > 0, mb: if len > 0 { len / 1_048_576 + 256 } else { 0 }, model: None });
+    }
+    let fam = model_family(args, info)?;
+    let d = DRAFTS.iter().find(|d| d.family == fam)?;
+    let path = draft_dir().join(d.file);
+    let present = std::fs::metadata(&path).map(|m| m.is_file() && m.len() == d.size).unwrap_or(false);
+    Some(DraftPick { path, name: d.name.into(), present, mb: d.size / 1_048_576 + 256, model: Some(d) })
+}
+
+/// Draft (path, MB) a plan should reserve GPU memory for: on + a draft exists or will be downloaded.
+pub fn draft_reserve(s: &crate::settings::Settings, args: Option<&StartModelArgs>, info: Option<&crate::split::ModelInfo>) -> Option<(String, u64)> {
+    if !s.draft_enabled { return None; }
+    let p = draft_pick(s, args?, info)?;
+    (p.present || p.model.is_some()).then(|| (p.path.display().to_string(), p.mb))
+}
+
+/// Same vocabulary? llama.cpp refuses drafts whose vocab differs by more than 128 tokens.
+fn vocab_compatible(main: &crate::split::ModelInfo, draft: &crate::split::ModelInfo) -> bool {
+    let fam = |i: &crate::split::ModelInfo| arch_family(&i.arch, i.n_vocab).map(str::to_string).unwrap_or_else(|| i.arch.clone());
+    let same_family = main.arch.is_empty() || draft.arch.is_empty() || fam(main) == fam(draft);
+    let close_vocab = main.n_vocab == 0 || draft.n_vocab == 0 || main.n_vocab.abs_diff(draft.n_vocab) <= 128;
+    same_family && close_vocab
+}
+
+/// Launch side: the draft to pass with -md, downloading the family draft when it is missing.
+/// Any problem turns the draft off for this run only, with a plain message in the engine log.
+async fn prepare_draft(app: &AppHandle, st: &Arc<AppState>, args: &StartModelArgs, info: Option<&crate::split::ModelInfo>) -> Option<(String, u64)> {
+    let s = st.settings.lock().await.clone();
+    if !s.draft_enabled { return None; }
+    let say = |m: String| { log::info!("{m}"); let _ = app.emit("llama-log", format!("[argus] {m}")); };
+    let model_name = args.alias.clone().or_else(|| args.hf_repo.clone()).unwrap_or_else(|| "этой модели".into());
+    let Some(pick) = draft_pick(&s, args, info) else {
+        say(format!("Ускорение черновиком: для {model_name} нет маленькой модели того же семейства — запускаю без него."));
+        return None;
+    };
+    if !pick.present {
+        let Some(d) = pick.model else {
+            say(format!("Ускорение черновиком: файл {} не найден — запускаю без черновика.", pick.path.display()));
+            return None;
+        };
+        say(format!("Скачиваю черновую модель {} ({:.2} ГБ) — это один раз.", d.name, d.size as f64 / 1e9));
+        if let Err(e) = download_draft(app, d).await {
+            say(format!("Не получилось скачать черновую модель {}: {e}. Запускаю без ускорения черновиком.", d.name));
+            return None;
+        }
+        say(format!("Черновая модель {} скачана.", d.name));
+    }
+    let path = pick.path.display().to_string();
+    if let (Some(main), Some(dr)) = (info, st.model_info(&path).await) {
+        if !vocab_compatible(main, &dr) {
+            say(format!("Черновая модель {} не подходит к {model_name}: у них разный словарь. Ускорение черновиком выключено для этого запуска.", pick.name));
+            return None;
+        }
+    }
+    let mb = std::fs::metadata(&pick.path).map(|m| m.len() / 1_048_576 + 256).unwrap_or(pick.mb);
+    say(format!("Ускорение черновиком: {} помогает {model_name}.", pick.name));
+    Some((path, mb))
+}
+
+/// <models>/draft/<file> from Hugging Face (.part, then rename); progress goes to the engine log.
+async fn download_draft(app: &AppHandle, d: &DraftModel) -> Result<(), String> {
+    let dir = draft_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("папка {}: {e}", dir.display()))?;
+    let url = format!("https://huggingface.co/{}/resolve/main/{}?download=true", d.repo, d.file);
+    let client = reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("Argus-Cluster/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
+    let mut r = client.get(&url).send().await.map_err(|e| format!("нет связи с Hugging Face ({e})"))?;
+    if !r.status().is_success() { return Err(format!("Hugging Face ответил {}", r.status())); }
+    let total = r.content_length().unwrap_or(d.size);
+    let part = dir.join(format!("{}.part", d.file));
+    let mut f = tokio::fs::File::create(&part).await.map_err(|e| format!("не удалось создать {}: {e}", part.display()))?;
+    let (mut done, mut last) = (0u64, Instant::now());
+    loop {
+        let chunk = match timeout(Duration::from_secs(60), r.chunk()).await {
+            Ok(Ok(Some(c))) => c,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => { let _ = tokio::fs::remove_file(&part).await; return Err(format!("загрузка оборвалась ({e})")); }
+            Err(_) => { let _ = tokio::fs::remove_file(&part).await; return Err("загрузка зависла на минуту".into()); }
+        };
+        if let Err(e) = f.write_all(&chunk).await { let _ = tokio::fs::remove_file(&part).await; return Err(format!("запись на диск: {e}")); }
+        done += chunk.len() as u64;
+        if last.elapsed() > Duration::from_secs(3) {
+            last = Instant::now();
+            let _ = app.emit("llama-log", format!("[argus] черновая модель {}: {}% ({} из {} МБ)", d.name,
+                done * 100 / total.max(1), done / 1_048_576, total / 1_048_576));
+        }
+    }
+    let _ = f.flush().await;
+    drop(f);
+    if done != total { let _ = tokio::fs::remove_file(&part).await; return Err(format!("скачалось {done} из {total} байт")); }
+    tokio::fs::rename(&part, dir.join(d.file)).await.map_err(|e| format!("не удалось сохранить файл: {e}"))?;
+    Ok(())
 }
 
 pub fn sessions_dir() -> std::path::PathBuf { model_cache_dir().join("sessions") }
@@ -141,6 +318,7 @@ pub fn gguf_info(path: &Path) -> Option<crate::split::ModelInfo> {
     let n_kv = u64_(&mut r)?;
     let mut ints: std::collections::HashMap<String, u64> = Default::default();
     let mut arch = String::new();
+    let mut n_vocab = 0u32;
     for _ in 0..n_kv {
         let key = str_(&mut r)?;
         let t = u32_(&mut r)?;
@@ -149,6 +327,7 @@ pub fn gguf_info(path: &Path) -> Option<crate::split::ModelInfo> {
             9 => {
                 let it = u32_(&mut r)?;
                 let n = u64_(&mut r)?;
+                if key == "tokenizer.ggml.tokens" { n_vocab = n.min(u32::MAX as u64) as u32; }
                 if let Some(sz) = fixed(it) { r.seek(SeekFrom::Current(sz * n as i64)).ok()?; }
                 else if it == 8 { for _ in 0..n { let l = u64_(&mut r)?; r.seek(SeekFrom::Current(l as i64)).ok()?; } }
                 else { return None; } // nested arrays: not in real models
@@ -181,7 +360,7 @@ pub fn gguf_info(path: &Path) -> Option<crate::split::ModelInfo> {
     }
     Some(crate::split::ModelInfo {
         block_count: get("block_count"), expert_count: get("expert_count"), expert_used: get("expert_used_count"),
-        experts_mb: experts / 1_048_576, weights_mb: data_len / 1_048_576,
+        experts_mb: experts / 1_048_576, weights_mb: data_len / 1_048_576, arch, n_vocab,
     })
 }
 
@@ -251,21 +430,14 @@ pub fn build_args(args: &StartModelArgs, snap: &crate::state::ClusterSnapshot) -
     // ---- speed
     if let Some(n) = args.cache_reuse.filter(|n| *n > 0) { push(&["--cache-reuse", &n.to_string()]); }
     if let Some((d, _)) = snap.draft.as_ref() {
-        // local draft model (settings «Черновая модель»): on the local GPU, q8 KV
-        push(&["-md", d, "--spec-type", "draft-simple", "--spec-draft-n-max", "8", "--spec-draft-n-min", "2"]);
+        // draft model (settings.draft_enabled, picked by family in prepare_draft): on the local GPU, q8 KV
+        let n_max = args.draft_max.unwrap_or(16).clamp(2, 64).to_string();
+        push(&["-md", d, "--spec-type", "draft-simple", "--spec-draft-n-max", &n_max, "--spec-draft-n-min", "2"]);
         match &local_gpu {
             Some(g) => push(&["-devd", g, "-ngld", "99"]),
             None => push(&["-devd", "none"]),
         }
         push(&["-ctkd", "q8_0", "-ctvd", "q8_0"]);
-    } else if let Some(d) = args.draft_hf.as_deref().filter(|d| !d.is_empty()) {
-        push(&["-hfd", d, "--spec-type", "draft-simple"]);
-        push(&["--spec-draft-n-max", &args.draft_max.unwrap_or(16).to_string(), "--spec-draft-n-min", "1"]);
-        // the draft is small: keep it entirely on the local GPU (or CPU) — never on a phone over USB
-        match &local_gpu {
-            Some(g) => push(&["-devd", g, "-ngld", "99"]),
-            None => push(&["-devd", "none"]),
-        }
     }
     a.extend(crate::vision::mmproj_args(args.mmproj.as_deref(), args.hf_repo.as_deref()));
     Ok(a)
@@ -444,15 +616,19 @@ pub async fn stop_for_update(st: &AppState) {
 
 // ---------------------------------------------------------------- launch
 
-async fn launch(app: &AppHandle, st: &Arc<AppState>, args: StartModelArgs, auto: bool) -> Result<String, String> {
+async fn launch(app: &AppHandle, st: &Arc<AppState>, mut args: StartModelArgs, auto: bool) -> Result<String, String> {
     let _guard = st.launch_lock.lock().await;
-    // GGUF header (layers / experts) for the plan: cached by path
-    if let Some(p) = local_model_path(&args) { let _ = st.model_info(&p).await; }
-    let snap = st.snapshot().await;
+    // GGUF header (layers / experts / vocab) for the plan and the draft check: cached by path
+    args.local_path = local_model_path(&args);
+    let info = match args.local_path.clone() { Some(p) => st.model_info(&p).await, None => None };
+    // the draft is decided here (download / family check); the plan reserves GPU memory for exactly it
+    let draft = prepare_draft(app, st, &args, info.as_ref()).await;
+    let mut snap = st.snapshot().await;
+    snap.draft = draft;
     let plan = launch_plan(&args, &snap);
     let rpc = plan_endpoints(&plan, &snap).join(",");
     let sig = serde_json::to_string(&(&args.hf_repo, &args.hf_file, &args.model_path, &args.ctx, &args.lan,
-        &args.draft_hf, &args.cache_reuse, &rpc, plan.entries.iter().map(|e| (&e.device, (e.share * 1000.0).round() as u32)).collect::<Vec<_>>(),
+        (&snap.draft, &args.draft_max), &args.cache_reuse, &rpc, plan.entries.iter().map(|e| (&e.device, (e.share * 1000.0).round() as u32)).collect::<Vec<_>>(),
         (plan.cpu_layers, plan.threads, plan.draft, plan.moe.as_ref().map(|m| m.gpu_blocks.len()), &args.gpu_only))).unwrap_or_default();
     if plan.cpu_layers > 0 { let _ = app.emit("llama-log", format!("[argus] {} слоёв на процессоре ПК ({} потоков)", plan.cpu_layers, plan.threads.unwrap_or(0))); }
     if let Some(m) = &plan.moe { let _ = app.emit("llama-log", format!("[argus] MoE: внимание и KV на GPU, эксперты {} блоков вынесены", m.block_count as usize - m.gpu_blocks.len())); }
@@ -752,10 +928,15 @@ async fn warmup(app: &AppHandle, st: &Arc<AppState>, system: Option<String>) {
 /// 0.3.2: split preview for a model size (Models: which nodes would work, which stay free, ≈ tok/s).
 #[tauri::command]
 pub async fn plan_split(state: State<'_, Arc<AppState>>, need_mb: Option<u64>, model_path: Option<String>,
-                        gpu_only: Option<bool>) -> Result<crate::split::Plan, String> {
-    let args = StartModelArgs { need_mb, model_path: model_path.filter(|p| !p.is_empty()), gpu_only, ..Default::default() };
-    if let Some(p) = local_model_path(&args) { let _ = state.model_info(&p).await; }
-    let snap = state.snapshot().await;
+                        hf_repo: Option<String>, hf_file: Option<String>, gpu_only: Option<bool>) -> Result<crate::split::Plan, String> {
+    let nz = |v: Option<String>| v.filter(|p| !p.trim().is_empty());
+    let mut args = StartModelArgs { need_mb, model_path: nz(model_path), hf_repo: nz(hf_repo), hf_file: nz(hf_file), gpu_only, ..Default::default() };
+    // same inputs as launch(): GGUF header of the local file (MoE experts, layers) + the draft it would get
+    args.local_path = local_model_path(&args);
+    let info = match args.local_path.clone() { Some(p) => state.model_info(&p).await, None => None };
+    let settings = state.settings.lock().await.clone();
+    let mut snap = state.snapshot().await;
+    snap.draft = draft_reserve(&settings, Some(&args), info.as_ref());
     Ok(launch_plan(&args, &snap))
 }
 
@@ -828,15 +1009,43 @@ pub async fn set_draft_enabled(state: State<'_, Arc<AppState>>, enabled: bool, p
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DraftStatus { pub enabled: bool, pub path: Option<String>, pub present: bool, pub size_mb: u64 }
+pub struct DraftStatus {
+    /// settings.draft_enabled — the one switch «Ускорение черновиком»
+    pub enabled: bool,
+    /// draft for the given model (None = no same-family draft)
+    pub name: Option<String>,
+    pub path: Option<String>,
+    /// file already in <models>/draft/ (else it downloads at the next launch)
+    pub present: bool,
+    /// download / file size in MB
+    pub size_mb: u64,
+    /// plain explanation when there is no draft for this model
+    pub note: Option<String>,
+}
 
+/// Draft for a model (optional hints: hf repo/file, local path, alias); without hints only `enabled`.
 #[tauri::command]
-pub async fn get_draft_status(state: State<'_, Arc<AppState>>) -> Result<DraftStatus, String> {
+pub async fn get_draft_status(state: State<'_, Arc<AppState>>, hf_repo: Option<String>, hf_file: Option<String>,
+                              model_path: Option<String>, alias: Option<String>, mmproj: Option<String>) -> Result<DraftStatus, String> {
     let s = state.settings.lock().await.clone();
-    let on = crate::settings::Settings { draft_enabled: true, ..s.clone() };
-    let f = draft_file(&on);
-    let size_mb = f.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len() / 1_048_576).unwrap_or(0);
-    Ok(DraftStatus { enabled: s.draft_enabled, path: f.map(|p| p.display().to_string()).or(s.draft_path), present: size_mb > 0, size_mb })
+    let nz = |v: Option<String>| v.filter(|p| !p.trim().is_empty());
+    let mut args = StartModelArgs { hf_repo: nz(hf_repo), hf_file: nz(hf_file), model_path: nz(model_path), alias: nz(alias), mmproj: nz(mmproj), ..Default::default() };
+    let hinted = args.hf_repo.is_some() || args.hf_file.is_some() || args.model_path.is_some() || args.alias.is_some();
+    args.local_path = local_model_path(&args);
+    let info = match args.local_path.clone() { Some(p) => state.model_info(&p).await, None => None };
+    let pick = draft_pick(&s, &args, info.as_ref());
+    let size_mb = pick.as_ref().map(|p| match p.model {
+        Some(d) => d.size / 1_048_576,
+        None => std::fs::metadata(&p.path).map(|m| m.len() / 1_048_576).unwrap_or(0),
+    }).unwrap_or(0);
+    let note = match (&pick, hinted) {
+        (None, true) if args.mmproj.is_some() => Some("модели с картинками запускаются без черновика".to_string()),
+        (None, true) => Some("для этой модели нет маленькой модели того же семейства".to_string()),
+        (Some(p), _) if !p.present && p.model.is_none() => Some(format!("файл {} не найден", p.path.display())),
+        _ => None,
+    };
+    Ok(DraftStatus { enabled: s.draft_enabled, name: pick.as_ref().map(|p| p.name.clone()), path: pick.as_ref().map(|p| p.path.display().to_string()),
+                     present: pick.as_ref().map(|p| p.present).unwrap_or(false), size_mb, note })
 }
 
 // ---------------------------------------------------------------- commands
@@ -959,6 +1168,25 @@ mod tests {
         let c: Vec<String> = ["llama-server", "-hf", "x", "--rpc", "127.0.0.1:50052,192.168.1.5:50052", "--device", "RPC0"].iter().map(|s| s.to_string()).collect();
         assert_eq!(rpc_from_cmdline(&c), vec!["127.0.0.1:50052", "192.168.1.5:50052"]);
         assert!(rpc_from_cmdline(&c[..3]).is_empty());
+    }
+    #[test]
+    fn draft_family() {
+        let a = |repo: &str| StartModelArgs { hf_repo: Some(repo.into()), ..Default::default() };
+        assert_eq!(model_family(&a("unsloth/Qwen3-8B-GGUF:Q4_K_M"), None), Some("qwen3"));
+        assert_eq!(model_family(&a("unsloth/Qwen3-0.6B-GGUF:Q4_0"), None), None, "a draft has no draft");
+        assert_eq!(model_family(&a("NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M"), None), Some("llama3"));
+        assert_eq!(model_family(&a("bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M"), None), None);
+        assert_eq!(model_family(&a("bartowski/gemma-2-9b-it-GGUF:Q4_K_M"), None), Some("gemma2"));
+        assert_eq!(model_family(&a("bartowski/Mistral-7B-Instruct-v0.3-GGUF:Q4_K_M"), None), None);
+        assert_eq!(model_family(&StartModelArgs { mmproj: Some("x.gguf".into()), ..a("unsloth/Qwen3-8B-GGUF:Q4_K_M") }, None), None);
+        // the GGUF header wins over the name
+        let info = crate::split::ModelInfo { arch: "qwen2".into(), n_vocab: 152064, ..Default::default() };
+        assert_eq!(model_family(&StartModelArgs { model_path: Some("C:/m/qwen3-ish.gguf".into()), ..Default::default() }, Some(&info)), None);
+        let moe = crate::split::ModelInfo { arch: "qwen3moe".into(), n_vocab: 151936, ..Default::default() };
+        let dr = crate::split::ModelInfo { arch: "qwen3".into(), n_vocab: 151936, ..Default::default() };
+        let ll = crate::split::ModelInfo { arch: "llama".into(), n_vocab: 128256, ..Default::default() };
+        assert!(vocab_compatible(&moe, &dr));
+        assert!(!vocab_compatible(&ll, &dr));
     }
     #[test]
     fn error_lines() {

@@ -4,6 +4,10 @@
 //! (50062 + 100); a second phone gets 50172 for its helper, 50170/50171/50173 for its services, and so on.
 //! The node app reports its services in `dumpsys activity service …/.RpcService` as
 //! `argus-status {"roles":{"voice":{"state":"ready","port":50061},"library":{…},"embeddings":{…}}}`.
+//!
+//! Wi-Fi nodes: no forward. The same `roles` map arrives in the UDP beacon (beacon.rs `Discovered::roles`);
+//! the PC talks to the phone's IP directly (http://<ip>:50061 whisper, :50063 kiwix) and checks each service
+//! with a short HTTP request, so a role the phone calls "ready" but the PC cannot reach shows up as "unreachable".
 
 use crate::state::{AppState, Transport};
 use serde::Serialize;
@@ -26,8 +30,13 @@ const SERVICES: &[(&str, &str, u16)] = &[
 pub struct NodeService {
     pub device: String,
     pub service: String,
+    /// USB: forwarded port on the PC; Wi-Fi: the port on the phone itself
     pub pc_port: u16,
     pub state: String,
+    /// base URL the PC uses for this service (USB: http://127.0.0.1:<pc_port>, Wi-Fi: http://<phone ip>:<port>)
+    pub base: String,
+    /// "usb" | "wifi"
+    pub transport: String,
 }
 
 fn slots() -> &'static Mutex<Vec<String>> { static S: OnceLock<Mutex<Vec<String>>> = OnceLock::new(); S.get_or_init(Default::default) }
@@ -46,12 +55,89 @@ pub fn slot_of(serial: &str) -> u16 {
 /// PC port for a phone port of this device.
 pub fn pc_port(serial: &str, phone_port: u16) -> u16 { phone_port + 100 + 10 * slot_of(serial) }
 
-/// Base URL of a ready whisper server on any USB phone.
-pub fn whisper_base() -> Option<String> {
-    let m = services().lock().unwrap();
-    let mut v: Vec<&NodeService> = m.values().filter(|s| s.service == "whisper").collect();
-    v.sort_by_key(|s| (s.state != "ready", s.pc_port));
-    v.first().map(|s| format!("http://127.0.0.1:{}", s.pc_port))
+/// Base URLs of a service ("whisper" | "kiwix" | "embeddings") on all phones, ready ones first, USB before Wi-Fi.
+pub fn bases(service: &str) -> Vec<String> {
+    let m = services().lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<&NodeService> = m.values().filter(|s| s.service == service).collect();
+    v.sort_by_key(|s| (s.state != "ready", s.transport != "usb", s.pc_port, s.device.clone()));
+    v.into_iter().map(|s| s.base.clone()).collect()
+}
+
+/// Base URLs of a service that answered its last check.
+pub fn ready_bases(service: &str) -> Vec<String> {
+    let m = services().lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<&NodeService> = m.values().filter(|s| s.service == service && s.state == "ready").collect();
+    v.sort_by_key(|s| (s.transport != "usb", s.pc_port, s.device.clone()));
+    v.into_iter().map(|s| s.base.clone()).collect()
+}
+
+/// Base URL of a whisper server on any phone (USB or Wi-Fi), a ready one if there is one.
+pub fn whisper_base() -> Option<String> { bases("whisper").into_iter().next() }
+
+/// beacons come every 2 s; older roles info is not trusted
+const BEACON_FRESH: Duration = Duration::from_secs(10);
+
+fn http_client() -> &'static reqwest::Client {
+    static C: OnceLock<reqwest::Client> = OnceLock::new();
+    C.get_or_init(|| reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_millis(2500)).build().unwrap_or_default())
+}
+
+/// any HTTP answer on GET / = the server is listening (same check the node app does on 127.0.0.1)
+async fn http_alive(base: &str) -> bool {
+    http_client().get(format!("{base}/")).send().await.is_ok()
+}
+
+fn inactive(state: &str) -> bool { matches!(state, "idle" | "off" | "disabled" | "stopped") }
+
+/// Wi-Fi nodes: role status from the beacon (or the user's choice when the beacon says nothing), checked over HTTP.
+async fn tick_lan(st: &Arc<AppState>) -> Vec<String> {
+    let lan: Vec<(String, String, bool)> = st.nodes.lock().await.values()
+        .filter(|n| n.transport == Transport::Lan)
+        .filter_map(|n| {
+            let ep = n.endpoint.as_deref()?;
+            let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep).trim_matches(|c| c == '[' || c == ']').to_string();
+            Some((n.id.clone(), host, n.online()))
+        }).collect();
+    let disc: HashMap<String, serde_json::Value> = st.discovered.lock().await.iter()
+        .filter(|(_, d)| d.last_seen.elapsed() < BEACON_FRESH)
+        .filter_map(|(k, d)| d.roles.clone().map(|r| (k.clone(), r))).collect();
+    let mut seen = Vec::new();
+    for (id, host, online) in lan {
+        let roles = disc.get(&id);
+        if roles.is_none() && !online && !st.discovered.lock().await.get(&id).map(|d| d.last_seen.elapsed() < BEACON_FRESH).unwrap_or(false) {
+            // node gone: forget its services
+            services().lock().unwrap_or_else(|e| e.into_inner()).retain(|(d, _), _| d != &id);
+            continue;
+        }
+        seen.push(id.clone());
+        let (want_voice, want_library) = crate::roles_extra::wanted(&id);
+        for &(role, name, def_port) in SERVICES {
+            let key = (id.clone(), name.to_string());
+            let r = roles.and_then(|r| r.get(role)).filter(|v| v.is_object());
+            let reported = r.and_then(|v| v["state"].as_str()).map(str::to_string);
+            let port = r.and_then(|v| v["port"].as_u64()).and_then(|p| u16::try_from(p).ok()).unwrap_or(def_port);
+            let wanted = match role { "voice" => want_voice, "library" => want_library, _ => false };
+            let active = reported.as_deref().map(|s| !inactive(s)).unwrap_or(false);
+            // no beacon roles (older node / beacon lost): probe only what the user turned on here
+            if !active && !(reported.is_none() && wanted) {
+                services().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                continue;
+            }
+            let base = format!("http://{host}:{port}");
+            let state = if http_alive(&base).await { "ready".to_string() } else {
+                match reported.as_deref() {
+                    Some("ready") => "unreachable".to_string(),
+                    Some(s) => s.to_string(),
+                    None => { services().lock().unwrap_or_else(|e| e.into_inner()).remove(&key); continue; }
+                }
+            };
+            services().lock().unwrap_or_else(|e| e.into_inner()).insert(key, NodeService {
+                device: id.clone(), service: name.into(), pc_port: port, state, base, transport: "wifi".into(),
+            });
+        }
+    }
+    seen
 }
 
 /// `argus-status {json}` → role → (state, port)
@@ -70,10 +156,11 @@ pub fn parse_status(out: &str) -> HashMap<String, (String, Option<u16>)> {
 }
 
 async fn tick(st: &Arc<AppState>) {
+    let lan = tick_lan(st).await;
     let usb: Vec<String> = st.nodes.lock().await.values()
         .filter(|n| n.transport == Transport::Usb && n.online()).map(|n| n.id.clone()).collect();
-    // unplugged devices: drop their services (adb removes forwards itself on disconnect)
-    services().lock().unwrap().retain(|(d, _), _| usb.contains(d));
+    // unplugged devices / removed Wi-Fi nodes: drop their services (adb removes forwards itself on disconnect)
+    services().lock().unwrap_or_else(|e| e.into_inner()).retain(|(d, _), _| usb.contains(d) || lan.contains(d));
     if usb.is_empty() { return; }
     let fw = st.adb.forward_list().await.unwrap_or_default();
     for serial in usb {
@@ -83,7 +170,7 @@ async fn tick(st: &Arc<AppState>) {
             let key = (serial.clone(), name.to_string());
             let local = pc_port(&serial, def_port);
             match roles.get(role) {
-                Some((state, port)) if !matches!(state.as_str(), "idle" | "off" | "disabled" | "stopped") => {
+                Some((state, port)) if !inactive(state) => {
                     let remote = port.unwrap_or(def_port);
                     let mut state = state.clone();
                     if !fw.iter().any(|(s, l, r)| s == &serial && *l == local && *r == remote) {
@@ -92,10 +179,13 @@ async fn tick(st: &Arc<AppState>) {
                             state = "error".into();
                         }
                     }
-                    services().lock().unwrap().insert(key, NodeService { device: serial.clone(), service: name.into(), pc_port: local, state });
+                    services().lock().unwrap_or_else(|e| e.into_inner()).insert(key, NodeService {
+                        device: serial.clone(), service: name.into(), pc_port: local, state,
+                        base: format!("http://127.0.0.1:{local}"), transport: "usb".into(),
+                    });
                 }
                 _ => {
-                    let had = services().lock().unwrap().remove(&key).is_some();
+                    let had = services().lock().unwrap_or_else(|e| e.into_inner()).remove(&key).is_some();
                     if had { let _ = st.adb.remove_forward(local).await; }
                 }
             }
@@ -113,7 +203,7 @@ pub async fn run(st: Arc<AppState>) {
 
 #[tauri::command]
 pub async fn nodesvc_list() -> Result<Vec<NodeService>, String> {
-    let mut v: Vec<NodeService> = services().lock().unwrap().values().cloned().collect();
+    let mut v: Vec<NodeService> = services().lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
     v.sort_by(|a, b| (a.pc_port, &a.device).cmp(&(b.pc_port, &b.device)));
     Ok(v)
 }

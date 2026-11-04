@@ -1,6 +1,7 @@
 //! Node roles «Голос» (whisper-server) and «Библиотека» (kiwix-serve), Argus Node 0.3.3+ (docs/ROLES.md «Протокол ролей ноды»).
 //!
-//! The user's choice per node lives in argus-features.json → `nodeRoles` ({id: {voice, voiceModel, library}}).
+//! The user's choice per node lives in argus-features.json → `nodeRoles` ({id: {voice, voiceModel, voiceThreads, library}}).
+//! voiceThreads (0 = node default) goes to the node as `--ei voice_threads N` (USB) or `"voice":{…,"threads":N}` (Wi-Fi).
 //! * Голос: the ggml whisper model is downloaded once to the PC (helpers_dir, same downloader/progress as «Помощник»),
 //!   served on :50055 `/helper/<file>`; USB nodes get it through `adb reverse`, Wi-Fi nodes through the beacon reply.
 //! * Библиотека: the .zim is chosen on the phone (Argus Node → «Выбрать .zim»); the PC only turns the role on/off.
@@ -36,6 +37,15 @@ pub struct NodeRolePref {
     /// "tiny" | "base" | "small"
     pub voice_model: String,
     pub library: bool,
+    /// whisper-server -t on the phone; 0 = the node decides (its little cores, at least 2)
+    pub voice_threads: u32,
+}
+
+pub const MAX_VOICE_THREADS: u32 = 8;
+
+/// (voice, library) the user turned on for this node here (nodesvc.rs probes Wi-Fi nodes by it).
+pub fn wanted(id: &str) -> (bool, bool) {
+    prefs().get(id).map(|p| (p.voice, p.library)).unwrap_or((false, false))
 }
 
 fn prefs() -> HashMap<String, NodeRolePref> {
@@ -57,6 +67,11 @@ fn save_pref(id: &str, op: impl FnOnce(&mut NodeRolePref)) {
 /// last command per (node, role): (signature, when)
 fn sent() -> &'static Mutex<HashMap<(String, &'static str), (String, Instant)>> {
     static S: OnceLock<Mutex<HashMap<(String, &'static str), (String, Instant)>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+/// USB nodes whose voice threads were changed in the UI: resend even if the voice role already runs
+fn force_voice() -> &'static Mutex<std::collections::HashSet<String>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
     S.get_or_init(Default::default)
 }
 /// what the node said last (USB `argus-status` roles map) + a note from the PC side
@@ -112,6 +127,29 @@ async fn tick(st: &Arc<AppState>) {
     // 2. USB nodes: send the assignment
     let usb: Vec<String> = st.nodes.lock().await.values()
         .filter(|n| n.transport == Transport::Usb && n.online()).map(|n| n.id.clone()).collect();
+    // 3. Wi-Fi nodes: the beacon carries the same roles map as `argus-status`; assignments go in the beacon reply
+    {
+        let disc = st.discovered.lock().await;
+        let mut stt = status().lock().unwrap_or_else(|e| e.into_inner());
+        for (id, p) in &all {
+            if !id.starts_with("lan:") { continue; }
+            match disc.get(id).filter(|d| d.last_seen.elapsed() < Duration::from_secs(15)) {
+                Some(d) => {
+                    let roles = d.roles.clone().unwrap_or(serde_json::Value::Null);
+                    let note = if d.roles.is_none() && (p.voice || p.library) {
+                        "Для ролей «Голос» и «Библиотека» нужна Argus Node 0.3.3 — обновите ноду".to_string()
+                    } else if p.voice && voice_file(&p.voice_model).map(|f| !ready_files.contains_key(&f)).unwrap_or(false) {
+                        "Голос: модель ещё качается на ПК".to_string()
+                    } else { String::new() };
+                    stt.insert(id.clone(), (roles, note));
+                }
+                None => {
+                    let note = if p.voice || p.library { "Телефон не виден в сети — нет маяка последние 15 с" } else { "" };
+                    stt.insert(id.clone(), (serde_json::Value::Null, note.into()));
+                }
+            }
+        }
+    }
     for (id, p) in &all {
         if !usb.contains(id) { continue; }
         let dump = st.adb.shell(id, &format!("dumpsys activity service {NODE_PKG}/.RpcService")).await.unwrap_or_default();
@@ -127,14 +165,19 @@ async fn tick(st: &Arc<AppState>) {
             match voice_file(&p.voice_model) {
                 Some(file) => match ready_files.get(&file) {
                     Some(&size) => {
-                        let running = vm == file && ACTIVE.contains(&vs.as_str());
-                        let sig = format!("{file}|{size}");
-                        if !running && due(id, "voice", &sig) {
+                        let want_t = p.voice_threads.min(MAX_VOICE_THREADS);
+                        let node_t = roles["voice"]["threads"].as_u64().unwrap_or(0) as u32;
+                        // 0 = node default: whatever it picked is fine; otherwise it must run with ours
+                        let running = vm == file && ACTIVE.contains(&vs.as_str()) && (want_t == 0 || node_t == want_t);
+                        let sig = format!("{file}|{size}|{want_t}");
+                        let threads_extra = if want_t > 0 { format!(" --ei voice_threads {want_t}") } else { String::new() };
+                        let forced = force_voice().lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                        if forced || (!running && due(id, "voice", &sig)) {
                             let port = crate::updater::NODE_UPDATE_PORT;
                             let rev = st.adb.run(&["-s", id, "reverse", &format!("tcp:{port}"), &format!("tcp:{port}")]).await;
                             let r = match rev {
                                 Err(e) => Err(format!("adb reverse: {e:#}")),
-                                Ok(_) => am(st, id, &format!("--es role voice --es voice_model {file} --es voice_url http://127.0.0.1:{port}/helper/{file} --el voice_size {size}")).await,
+                                Ok(_) => am(st, id, &format!("--es role voice --es voice_model {file} --es voice_url http://127.0.0.1:{port}/helper/{file} --el voice_size {size}{threads_extra}")).await,
                             };
                             mark(id, "voice", &sig);
                             if let Err(e) = r { note = format!("Голос: {e}"); }
@@ -179,7 +222,7 @@ pub fn extend_lan_reply(msg: Vec<u8>, node_id: &str) -> Vec<u8> {
         if let Some(file) = voice_file(&p.voice_model) {
             if let Ok(m) = std::fs::metadata(crate::helper::helpers_dir().join(&file)) {
                 if m.len() > 0 {
-                    j["voice"] = serde_json::json!({ "file": file, "path": format!("/helper/{file}"), "size": m.len(), "threads": 0 });
+                    j["voice"] = serde_json::json!({ "file": file, "path": format!("/helper/{file}"), "size": m.len(), "threads": p.voice_threads.min(MAX_VOICE_THREADS) });
                 }
             } // not on the PC yet: no key = no change
         }
@@ -201,6 +244,7 @@ pub struct VoiceModelView { pub id: String, pub label: String, pub size_mb: u64 
 pub struct NodeRolesView {
     pub voice: bool,
     pub voice_model: String,
+    pub voice_threads: u32,
     pub library: bool,
     pub models: Vec<VoiceModelView>,
     /// PC-side download of the chosen whisper model: None = on disk / not needed
@@ -227,17 +271,23 @@ pub async fn node_roles_get(state: State<'_, Arc<AppState>>, id: String) -> Resu
     }
     let (node, note) = status().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().unwrap_or((serde_json::Value::Null, String::new()));
     Ok(NodeRolesView {
-        voice: p.voice, voice_model: model, library: p.library,
+        voice: p.voice, voice_model: model, voice_threads: p.voice_threads.min(MAX_VOICE_THREADS), library: p.library,
         models: VOICE_MODELS.iter().map(|m| VoiceModelView { id: m.0.into(), label: m.1.into(), size_mb: m.2 }).collect(),
         download_pct: pct, download_error: err, model_on_pc: on_pc, node, note,
     })
 }
 
 #[tauri::command]
-pub async fn set_node_voice(state: State<'_, Arc<AppState>>, id: String, enabled: bool, model: Option<String>) -> Result<(), String> {
+pub async fn set_node_voice(state: State<'_, Arc<AppState>>, id: String, enabled: bool, model: Option<String>, threads: Option<u32>) -> Result<(), String> {
     let model = model.map(|m| m.trim().to_lowercase()).filter(|m| !m.is_empty());
     if let Some(m) = &model { if voice_file(m).is_none() { return Err("Модель голоса: tiny, base или small".into()); } }
-    save_pref(&id, |p| { p.voice = enabled; if let Some(m) = model { p.voice_model = m; } });
+    if let Some(t) = threads { if t > MAX_VOICE_THREADS { return Err(format!("Потоков для голоса: от 1 до {MAX_VOICE_THREADS} (или «авто»)")); } }
+    save_pref(&id, |p| {
+        p.voice = enabled;
+        if let Some(m) = model { p.voice_model = m; }
+        if let Some(t) = threads { p.voice_threads = t; }
+    });
+    if threads.is_some() && enabled { force_voice().lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone()); }
     if enabled {
         // voice.rs: an empty URL means «whisper on a phone» (nodesvc::whisper_base)
         crate::features::update(|f| f.voice.url.clear());
@@ -267,5 +317,7 @@ mod tests {
         assert_eq!(role_state(&r, "voice"), ("ready".to_string(), "ggml-base.bin".to_string()));
         assert_eq!(role_state(&r, "library").0, "idle");
         assert!(parse_roles("argus-helper state=idle").is_none());
+        let old: NodeRolePref = serde_json::from_str(r#"{"voice":true,"voiceModel":"tiny"}"#).unwrap();
+        assert_eq!(old.voice_threads, 0);
     }
 }

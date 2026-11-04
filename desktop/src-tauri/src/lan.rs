@@ -98,7 +98,7 @@ pub fn start_beacon_listener(app: AppHandle, st: Arc<AppState>) {
             match UdpSocket::bind(("0.0.0.0", BEACON_PORT)).await {
                 Ok(sock) => {
                     st.beacon_error.lock().await.clear();
-                    let mut buf = [0u8; 2048];
+                    let mut buf = [0u8; 8192]; // 0.3.3 beacons carry helper + roles + telemetry
                     loop {
                         let (n, src) = match sock.recv_from(&mut buf).await {
                             Ok(x) => x,

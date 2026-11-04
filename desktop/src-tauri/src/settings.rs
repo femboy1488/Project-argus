@@ -58,7 +58,7 @@ pub struct Settings {
     pub helper_model: String,
     /// speculative decoding with a small draft model (-md), off by default
     pub draft_enabled: bool,
-    /// local draft .gguf (None = first *.gguf in <models>/draft/)
+    /// local draft .gguf chosen by hand (None = the family draft in <models>/draft/, downloaded on demand)
     pub draft_path: Option<String>,
 }
 

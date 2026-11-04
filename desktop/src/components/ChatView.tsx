@@ -445,7 +445,7 @@ function SessionPanel() {
   const rows: [string, string][] = [
     ["Движок", "llama.cpp b12008"], ["Модель", m?.name ?? "—"], ["Квант", m?.quant ?? "—"], ["Контекст", `${ctx / 1024}K`],
     ["RPC-ноды", String(snapshot?.rpcServers.length ?? 0)], ["Сообщений", String(conv.messages.length)],
-    ["Спекулятивное", speed.speculative ? "вкл" : "выкл"], ["Кэш промпта", speed.promptCache ? "вкл" : "выкл"],
+    ["Черновик", snapshot?.draftEnabled ? "вкл" : "выкл"], ["Кэш промпта", speed.promptCache ? "вкл" : "выкл"],
   ];
   return (
     <aside className="flex flex-col overflow-y-auto bg-pl-bg1">

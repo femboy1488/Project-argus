@@ -38,18 +38,15 @@ export default function FeaturesView() {
     return () => { stop = true; clearInterval(iv); };
   }, [pushToast]);
 
-  // debounce-save only the sections this screen owns, merged onto the latest file (other screens edit other fields)
+  // debounce-save only the sections this screen owns; features_set merges them into the file on the PC side
+  // (other screens and the backend edit other fields, so nothing else is sent back)
   const save = (next: FView) => {
     setView(next);
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(async () => {
       try {
-        const latest = await featuresGet();
-        if (!latest) return;
-        const base: Record<string, unknown> = { ...latest };
-        READONLY.forEach((k) => delete base[k]);
-        const cfg = { ...base, webchat: next.webchat, telegram: next.telegram, routing: next.routing, lang: next.lang } as FeaturesConfig;
-        const v = await featuresSet(cfg);
+        const patch = { webchat: next.webchat, telegram: next.telegram, routing: next.routing, lang: next.lang };
+        const v = await featuresSet(patch as unknown as FeaturesConfig);
         if (v) setView((cur) => cur ? { ...cur, ...Object.fromEntries(READONLY.map((k) => [k, v[k]])), webchat: { ...cur.webchat, pin: v.webchat.pin } } as FView : v);
       } catch (e) { pushToast("error", String(e)); }
     }, 400);

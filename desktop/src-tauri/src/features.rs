@@ -203,17 +203,49 @@ fn view() -> FeaturesView {
 #[tauri::command]
 pub async fn features_get() -> Result<FeaturesView, String> { Ok(view()) }
 
-/// Replaces the whole features object (the UI sends what it got from features_get, edited).
-#[tauri::command]
-pub async fn features_set(features: serde_json::Value) -> Result<FeaturesView, String> {
-    let mut f: Features = serde_json::from_value(features).map_err(|e| format!("неверные настройки: {e}"))?;
-    // the view's read-only fields arrive flattened into `extra` — drop them
-    for k in ["lanIp", "webchatPort", "webchatUrl", "webchatRunning", "webchatError", "telegramStatus"] { f.extra.remove(k); }
+/// the view's read-only fields (they come back flattened when the UI sends a whole view)
+const VIEW_ONLY: &[&str] = &["lanIp", "webchatPort", "webchatUrl", "webchatRunning", "webchatError", "telegramStatus"];
+/// keys only the backend writes (through their own commands): a UI copy of them is always stale
+const BACKEND_OWNED: &[&str] = &["nodeRoles"];
+
+/// Deep merge: objects key by key, everything else (arrays, strings, null) replaced.
+fn merge(dst: &mut serde_json::Value, src: serde_json::Value) {
+    match (dst, src) {
+        (serde_json::Value::Object(d), serde_json::Value::Object(s)) => {
+            for (k, v) in s {
+                match d.get_mut(&k) {
+                    Some(x) if x.is_object() && v.is_object() => merge(x, v),
+                    _ => { d.insert(k, v); }
+                }
+            }
+        }
+        (d, s) => *d = s,
+    }
+}
+
+/// Read-modify-write under the store lock: `patch` (whole or partial features object) is merged into the
+/// current file, so two saves at once (several screens, roles_extra, the debounce) cannot wipe each other.
+fn apply_patch(patch: serde_json::Value) -> Result<(), String> {
+    let serde_json::Value::Object(mut obj) = patch else { return Err("неверные настройки: нужен объект".into()) };
+    for k in VIEW_ONLY.iter().chain(BACKEND_OWNED) { obj.remove(*k); }
+    let mut s = lock();
+    let mut cur = serde_json::to_value(&s.f).map_err(|e| e.to_string())?;
+    merge(&mut cur, serde_json::Value::Object(obj));
+    let mut f: Features = serde_json::from_value(cur).map_err(|e| format!("неверные настройки: {e}"))?;
     f.webchat.pin = f.webchat.pin.trim().to_string();
     if f.webchat.pin.is_empty() { f.webchat.pin = gen_pin(); }
     f.telegram.token = f.telegram.token.trim().to_string();
     if f.lang != "en" { f.lang = "ru".into(); }
-    update(|cur| *cur = f);
+    s.f = f;
+    let path = s.path.clone();
+    save(&path, &s.f);
+    Ok(())
+}
+
+/// Merges a whole or partial features object into the saved one (only the keys sent are changed).
+#[tauri::command]
+pub async fn features_set(features: serde_json::Value) -> Result<FeaturesView, String> {
+    apply_patch(features)?;
     Ok(view())
 }
 
@@ -232,6 +264,14 @@ mod tests {
         assert!(!is_simple("привет", true));
         assert!(!is_simple("```rust\nfn main(){}\n```", false));
         assert!(!is_simple(&"a".repeat(250), false));
+    }
+    #[test]
+    fn merge_partial() {
+        let mut cur = serde_json::json!({"webchat":{"enabled":false,"pin":"111111"},"telegram":{"allowedIds":[1,2]},"nodeRoles":{"a":{"voice":true}}});
+        merge(&mut cur, serde_json::json!({"webchat":{"enabled":true},"telegram":{"allowedIds":[3]}}));
+        assert_eq!(cur["webchat"], serde_json::json!({"enabled":true,"pin":"111111"}));
+        assert_eq!(cur["telegram"]["allowedIds"], serde_json::json!([3]));
+        assert_eq!(cur["nodeRoles"]["a"]["voice"], true);
     }
     #[test]
     fn old_file_loads() {

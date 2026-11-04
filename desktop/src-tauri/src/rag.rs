@@ -130,7 +130,9 @@ async fn service(st: &AppState, app: Option<&AppHandle>, custom: &str) -> Result
     if !custom.is_empty() {
         return Ok((custom.clone(), model_name(&client, &custom).await));
     }
-    if health(&client, PHONE_URL).await { return Ok((PHONE_URL.into(), model_name(&client, PHONE_URL).await)); }
+    let mut phones = crate::nodesvc::ready_bases("embeddings");
+    if !phones.iter().any(|b| b == PHONE_URL) { phones.push(PHONE_URL.into()); }
+    for b in phones { if health(&client, &b).await { return Ok((b.clone(), model_name(&client, &b).await)); } }
     let pc = format!("http://127.0.0.1:{PC_PORT}");
     if health(&client, &pc).await { return Ok((pc.clone(), model_name(&client, &pc).await)); }
     // start our own small embedding server on the PC CPU

@@ -180,7 +180,6 @@ export interface ModelEntry {
   vision?: boolean;    // ships an mmproj: can see screenshots
   moe?: boolean;       // mixture of experts: fast for its size
   score?: number;      // quality rank for "best pick" (higher = better)
-  draft?: string;      // same-family small model for speculative decoding (repo:quant)
   nLayers?: number;    // transformer blocks (for «Процессор ПК: N слоёв» and layer math)
   experts?: number;    // MoE: experts per layer
   expertsActive?: number; // MoE: experts used per token
@@ -240,10 +239,19 @@ export type ModelRunState =
   | { status: "broken"; model: ModelEntry; reason: string }
   | { status: "error"; message: string };
 
+/** llama.rs get_draft_status: the draft model Rust would use for a model («Ускорение черновиком»). */
+export interface DraftStatus {
+  enabled: boolean;        // settings.draft_enabled — the one switch
+  name: string | null;     // draft for this model, null = none of the same family
+  path: string | null;
+  present: boolean;        // already downloaded to <models>/draft/
+  sizeMb: number;
+  note: string | null;     // why there is no draft
+}
+
 export interface SpeedSettings {
-  speculative: boolean;
-  draft: string;        // "auto" | "none" | "repo:quant"
-  draftMax: number;
+  draftMax: number;     // --spec-draft-n-max (the draft on/off switch lives in Rust: snapshot.draftEnabled)
+  gpuOnly: boolean;     // «Только видеокарта»: no phones, no PC CPU layers (start_model + plan_split)
   promptCache: boolean; // --cache-reuse 256
   keepLoaded: boolean;
   fastStart: boolean;   // mirrored in Rust settings

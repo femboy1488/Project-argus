@@ -117,6 +117,10 @@ pub struct ModelInfo {
     /// MB of `ffn_*_exps` tensors (0 = dense model / unknown)
     pub experts_mb: u64,
     pub weights_mb: u64,
+    /// general.architecture ("qwen3", "qwen3moe", "llama", "gemma2" …) — for the draft-model check
+    pub arch: String,
+    /// tokenizer.ggml.tokens length (0 = unknown) — a draft model must share the vocabulary
+    pub n_vocab: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -570,7 +574,7 @@ mod tests {
     fn moe_experts_offloaded() {
         // 30B-A3B-like: 48 blocks, experts 15000 MB of 17000, GPU 3584
         let o = PlanOpts { cpu: Some(CpuDev { gbps: 10.0, usable_mb: 9000, threads: 5 }),
-            model: Some(ModelInfo { block_count: 48, expert_count: 128, expert_used: 8, experts_mb: 15000, weights_mb: 16500 }), ..Default::default() };
+            model: Some(ModelInfo { block_count: 48, expert_count: 128, expert_used: 8, experts_mb: 15000, weights_mb: 16500, ..Default::default() }), ..Default::default() };
         let p = plan_ex(&[n("tab", 4000, 18.0), n("note", 5600, 9.0)], &[g("Vulkan0", 3584)], Some(17000), &auto, &o);
         let m = p.moe.as_ref().expect("moe plan");
         assert_eq!(m.dense_mb, 2000);

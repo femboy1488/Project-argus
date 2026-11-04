@@ -9,14 +9,17 @@ import type { ClusterNode } from "../lib/types";
 
 const STATE_RU: Record<string, string> = {
   idle: "выключен", downloading: "получает модель", starting: "запускается", loading: "запускается", ready: "работает", error: "ошибка",
+  unreachable: "телефон говорит, что работает, но компьютер до него не достучался",
 };
 
 function stateText(r: NodeRoleReport | undefined, svc: NodeService | undefined): string | null {
-  if (svc) {
-    const base = STATE_RU[svc.state] ?? svc.state;
-    return svc.state === "ready" ? `${base} · ПК :${svc.pc_port}` : base;
+  if (svc?.state === "ready") {
+    const where = svc.transport === "wifi" ? svc.base.replace(/^https?:\/\//, "") : `ПК :${svc.pc_port}`;
+    return `${STATE_RU.ready} · ${where}`;
   }
-  if (!r?.state) return null;
+  if (svc?.state === "unreachable") return `${STATE_RU.unreachable} (${svc.base.replace(/^https?:\/\//, "")})`;
+  // the node's own report says more (download %, error text) than the service row
+  if (!r?.state) return svc ? (STATE_RU[svc.state] ?? svc.state) : null;
   let t = STATE_RU[r.state] ?? r.state;
   if (r.state === "downloading" && r.pct != null) t += ` ${Math.round(r.pct)}%`;
   if (r.error) t += `: ${r.error}`;
@@ -39,8 +42,8 @@ export default function NodeExtraRoles({ node }: { node: ClusterNode }) {
   const kiwix = svc.find((s) => s.service === "kiwix");
   const err = (e: unknown) => pushToast("error", String(e));
 
-  async function voice(on: boolean, model?: VoiceModelId) {
-    try { await setNodeVoice(node.id, on, model); load(); } catch (e) { err(e); }
+  async function voice(on: boolean, model?: VoiceModelId, threads?: number) {
+    try { await setNodeVoice(node.id, on, model, threads); load(); } catch (e) { err(e); }
   }
   async function library(on: boolean) {
     try { await setNodeLibrary(node.id, on); load(); } catch (e) { err(e); }
@@ -61,6 +64,14 @@ export default function NodeExtraRoles({ node }: { node: ClusterNode }) {
             onChange={(e) => voice(true, e.target.value as VoiceModelId)}>
             {v.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
           </select>
+          <label className="flex items-center gap-2 text-2xs text-pl-dim">
+            Потоков на телефоне
+            <select className="border border-pl-line2 bg-pl-bg2 px-2 py-0.5 text-2xs text-pl-text" value={v.voiceThreads ?? 0}
+              onChange={(e) => voice(true, undefined, Number(e.target.value))}>
+              <option value={0}>сам решит</option>
+              {[1, 2, 3, 4, 6, 8].map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
           {!v.modelOnPc && v.downloadError && <p className="text-2xs leading-4 text-pl-red">Не получилось скачать модель: {v.downloadError}</p>}
           {!v.modelOnPc && !v.downloadError && (
             <div>
@@ -77,7 +88,6 @@ export default function NodeExtraRoles({ node }: { node: ClusterNode }) {
       {v.library && libState && <p className="pl-1 text-2xs text-pl-dim">На телефоне: {libState}{v.node?.library?.zim ? ` · ${v.node.library.zim}` : ""}</p>}
 
       {v.note && <p className="text-2xs leading-4 text-pl-gold">{v.note}</p>}
-      {lan && (v.voice || v.library) && <p className="text-2xs leading-4 text-pl-dim">По Wi-Fi состояние ролей видно в самом Argus Node.</p>}
     </div>
   );
 }

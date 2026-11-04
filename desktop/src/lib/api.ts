@@ -1,6 +1,6 @@
 // Thin bridge to the Rust side. Falls back to mock data when opened in a plain browser (npm run dev).
 import type {
-  ClusterNode, ClusterSnapshot, DiscoveredNode, EngineView, HelperDelta, HelperReply, HelperView, ModelEntry, NodeRole, SplitEntry, SplitPlan,
+  ClusterNode, ClusterSnapshot, DiscoveredNode, DraftStatus, EngineView, HelperDelta, HelperReply, HelperView, ModelEntry, NodeRole, SplitEntry, SplitPlan,
   UpdateProgress, UpdateStatus,
 } from "./types";
 
@@ -116,7 +116,7 @@ export const platformInfo = (): Promise<PlatformInfo> =>
 
 export interface StartOpts {
   ctx?: number; lan?: boolean; needMb?: number;
-  draftHf?: string; draftMax?: number; cacheReuse?: number; keepLoaded?: boolean;
+  draftMax?: number; cacheReuse?: number; keepLoaded?: boolean; gpuOnly?: boolean;
   /** 0.3.2: system prompt of the current chat, processed once right after load («Прогрев…») */
   warmupSystem?: string;
 }
@@ -129,7 +129,7 @@ export async function startModel(m: ModelEntry, opts: StartOpts = {}) {
   }
   return tauriInvoke<string>("start_model", { args: {
     hfRepo: m.hfRepo, hfFile: m.hfFile ?? null, ctx: opts.ctx ?? 8192, engine: "llama.cpp", alias: m.id, lan: !!opts.lan,
-    needMb: opts.needMb ?? null, draftHf: opts.draftHf ?? null, draftMax: opts.draftMax ?? null,
+    needMb: opts.needMb ?? null, draftMax: opts.draftMax ?? null, gpuOnly: !!opts.gpuOnly,
     cacheReuse: opts.cacheReuse ?? null, keepLoaded: !!opts.keepLoaded,
     warmupSystem: opts.warmupSystem?.trim() ? opts.warmupSystem : null,
   } });
@@ -144,9 +144,12 @@ export const setNodeRole = (id: string, role: NodeRole) =>
 export const rebenchNode = (id: string) =>
   isTauri ? tauriInvoke<number>("rebench_node", { id })
     : new Promise<number>((r) => setTimeout(() => { const g = +(6 + Math.random() * 14).toFixed(1); mock.bench[id] = g; r(g); }, 1800));
-/** Split preview for a model of `needMb` (weights + context). */
-export const planSplit = (needMb: number | null) =>
-  isTauri ? tauriInvoke<SplitPlan>("plan_split", { needMb }) : Promise.resolve(mockPlanExtras(mockPlan(needMb)));
+/** Split preview for a model of `needMb` (weights + context). With the model (its local / cached GGUF: real MoE
+ *  expert counts) and gpuOnly the preview is exactly what start_model will run. */
+export const planSplit = (needMb: number | null, o: { model?: ModelEntry | null; modelPath?: string | null; gpuOnly?: boolean } = {}) =>
+  isTauri ? tauriInvoke<SplitPlan>("plan_split", {
+    needMb, modelPath: o.modelPath ?? null, hfRepo: o.model?.hfRepo || null, hfFile: o.model?.hfFile ?? null, gpuOnly: o.gpuOnly ?? null,
+  }) : Promise.resolve(mockPlanExtras(mockPlan(needMb)));
 export const setRolesEnabled = (enabled: boolean) =>
   isTauri ? tauriInvoke<void>("set_roles_enabled", { enabled }) : (mock.rolesEnabled = enabled, Promise.resolve());
 export const setHelperModel = (model: string) =>
@@ -205,7 +208,18 @@ export const exportBenchResults = () =>
   isTauri ? tauriInvoke<string>("export_bench_results") : Promise.resolve(mockBenchReport());
 /** «Ускорение черновиком»: speculative decoding on/off (Rust picks the draft by model family). */
 export const setDraftEnabled = (enabled: boolean, path?: string | null) =>
-  isTauri ? tauriInvoke<void>("set_draft_enabled", { enabled, path: path ?? null }) : Promise.resolve();
+  isTauri ? tauriInvoke<void>("set_draft_enabled", { enabled, path: path ?? null }) : (mock.draftEnabled = enabled, Promise.resolve());
+/** Which draft Rust would use for this model (downloaded on the first launch when missing). */
+export const getDraftStatus = (m?: ModelEntry | null) =>
+  isTauri ? tauriInvoke<DraftStatus>("get_draft_status", { hfRepo: m?.hfRepo || null, hfFile: m?.hfFile ?? null, modelPath: null, alias: m?.id ?? null, mmproj: null })
+    : Promise.resolve(mockDraftStatus(m));
+function mockDraftStatus(m?: ModelEntry | null): DraftStatus {
+  const n = `${m?.hfRepo ?? ""} ${m?.name ?? ""}`.toLowerCase();
+  const d = m?.vision ? null : /qwen3/.test(n) && !/0\.6b/.test(n) ? ["Qwen3 0.6B", 364] as const
+    : /llama-?3|hermes-?3/.test(n) && !/-1b/.test(n) ? ["Llama 3.2 1B", 770] as const : /gemma-?2-(9|27)b/.test(n) ? ["Gemma 2 2B", 1629] as const : null;
+  return { enabled: !!mock.draftEnabled, name: d?.[0] ?? null, path: null, present: false, sizeMb: d?.[1] ?? 0,
+    note: m && !d ? "для этой модели нет маленькой модели того же семейства" : null };
+}
 
 function mockBenchReport(): string {
   const s = mockSnapshot();
@@ -454,6 +468,7 @@ const mock = {
   roles: { R58N9ABC: "helper" } as Record<string, NodeRole>,
   bench: { R52T1234: 18.2, R58N9ABC: 9.1 } as Record<string, number>,
   rolesEnabled: true,
+  draftEnabled: false,
   helperModel: "qwen3-0.6b",
   /** when a node got the «Помощник» role (drives the fake prepare → ready progression); 0 = long ago */
   helperSince: { R58N9ABC: 0 } as Record<string, number>,
@@ -624,7 +639,7 @@ function mockSnapshot(): ClusterSnapshot {
     engine: { status: mock.engine.status, reason: null, alias: mock.engine.alias, nodes: running ? plan.rpcIds.map((id) => nodes.find((n) => n.id === id)!.name) : [],
       pendingRestart: false, newNodes: false, canRestart: running, warming: running && Date.now() < mock.engine.warmUntil },
     needMb: mock.needMb, freeNodes: plan.freeIds, estTps: plan.estTps, fits: plan.fits,
-    rolesEnabled: mock.rolesEnabled, helperModel: mock.helperModel, helperModels: MOCK_HELPER_MODELS, helpers };
+    rolesEnabled: mock.rolesEnabled, draftEnabled: mock.draftEnabled, helperModel: mock.helperModel, helperModels: MOCK_HELPER_MODELS, helpers };
 }
 
 let mockStep = 0;
@@ -651,24 +666,26 @@ function mockTool(name: string, args: Record<string, unknown>): Promise<ToolOutp
 /** whisper.cpp transcription of a 16 kHz mono WAV (base64); base = whisper server URL, else a phone's whisper via adb forward */
 export const transcribe = (wavB64: string, base?: string) =>
   isTauri ? tauriInvoke<string>("transcribe", { wavB64, base: base || null }) : Promise.resolve("(демо) распознанный текст");
-export interface NodeService { device: string; service: string; pc_port: number; state: string }
+/** pc_port: USB = forwarded PC port, Wi-Fi = port on the phone; base = URL the PC uses; state also "unreachable" (Wi-Fi) */
+export interface NodeService { device: string; service: string; pc_port: number; state: string; base: string; transport: "usb" | "wifi" }
 export const nodesvcList = () => (isTauri ? tauriInvoke<NodeService[]>("nodesvc_list") : Promise.resolve([] as NodeService[]));
 // «Голос» / «Библиотека» on a node (roles_extra.rs, Argus Node 0.3.3+)
 export type VoiceModelId = "tiny" | "base" | "small";
 export interface NodeRoleReport { state?: string; pct?: number; model?: string; zim?: string; error?: string; import_pct?: number }
 export interface NodeRolesView {
-  voice: boolean; voiceModel: VoiceModelId; library: boolean;
+  voice: boolean; voiceModel: VoiceModelId; voiceThreads: number; library: boolean;
   models: { id: VoiceModelId; label: string; sizeMb: number }[];
   downloadPct: number | null; downloadError: string | null; modelOnPc: boolean;
   node: { voice?: NodeRoleReport; library?: NodeRoleReport } | null; note: string;
 }
 const mockRoles: NodeRolesView = {
-  voice: false, voiceModel: "base", library: false, downloadPct: null, downloadError: null, modelOnPc: false, node: null, note: "",
+  voice: false, voiceModel: "base", voiceThreads: 0, library: false, downloadPct: null, downloadError: null, modelOnPc: false, node: null, note: "",
   models: [{ id: "tiny", label: "tiny · 75 МБ · самый быстрый", sizeMb: 75 }, { id: "base", label: "base · 142 МБ · баланс", sizeMb: 142 }, { id: "small", label: "small · 466 МБ · точнее, медленнее", sizeMb: 466 }],
 };
 export const nodeRolesGet = (id: string) => (isTauri ? tauriInvoke<NodeRolesView>("node_roles_get", { id }) : Promise.resolve(mockRoles));
-export const setNodeVoice = (id: string, enabled: boolean, model?: VoiceModelId) =>
-  (isTauri ? tauriInvoke<void>("set_node_voice", { id, enabled, model: model ?? null }) : Promise.resolve());
+/** threads: whisper -t on the phone, 0 = the node decides; undefined = keep */
+export const setNodeVoice = (id: string, enabled: boolean, model?: VoiceModelId, threads?: number) =>
+  (isTauri ? tauriInvoke<void>("set_node_voice", { id, enabled, model: model ?? null, threads: threads ?? null }) : Promise.resolve());
 export const setNodeLibrary = (id: string, enabled: boolean) => (isTauri ? tauriInvoke<void>("set_node_library", { id, enabled }) : Promise.resolve());
 /** invoke a command that may not exist in this build: resolves null instead of throwing */
 export async function invokeOptional<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {

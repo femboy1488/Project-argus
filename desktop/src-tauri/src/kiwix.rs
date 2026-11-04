@@ -1,11 +1,12 @@
-//! «Библиотека»: offline Wikipedia & co. through kiwix-serve — on the phone (PC port 50163) or at a URL the
-//! user gives (saved in argus-kiwix.json). Search: /search?pattern=&books.name= (HTML), fallback /suggest;
+//! «Библиотека»: offline Wikipedia & co. through kiwix-serve — on a phone (USB: forwarded PC port from nodesvc.rs,
+//! Wi-Fi: http://<phone ip>:50063 directly) or at a URL the user gives (saved in argus-kiwix.json). Search: /search?pattern=&books.name= (HTML), fallback /suggest;
 //! read: an article page stripped to text (≤ 8000 chars); books: /catalog/v2/entries (OPDS Atom).
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tauri::State;
 
+/// first USB phone's forward; used when nodesvc has not listed the phone yet
 const PHONE_URL: &str = "http://127.0.0.1:50163";
 const MAX_READ: usize = 8000;
 
@@ -42,7 +43,9 @@ async fn base(st: &AppState) -> Result<String, String> {
         if reachable(&c, &url).await { return Ok(url); }
         return Err(format!("Библиотека по адресу {url} не отвечает"));
     }
-    if reachable(&c, PHONE_URL).await { return Ok(PHONE_URL.into()); }
+    let mut cands = crate::nodesvc::ready_bases("kiwix");
+    if !cands.iter().any(|b| b == PHONE_URL) { cands.push(PHONE_URL.into()); }
+    for b in cands { if reachable(&c, &b).await { return Ok(b); } }
     Err("Библиотека не найдена: нет телефона с библиотекой и не указан адрес kiwix-serve".into())
 }
 
@@ -138,7 +141,7 @@ async fn search_in(c: &reqwest::Client, base: &str, book: &Book, q: &str) -> Vec
 pub async fn kiwix_info(state: State<'_, Arc<AppState>>) -> Result<KiwixInfo, String> {
     let url = load_cfg(&state).url;
     let b = base(&state).await.ok();
-    Ok(KiwixInfo { phone: b.as_deref() == Some(PHONE_URL), url, base: b })
+    Ok(KiwixInfo { phone: b.is_some() && url.trim().is_empty(), url, base: b })
 }
 
 #[tauri::command]

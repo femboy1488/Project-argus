@@ -1,7 +1,7 @@
-// One place that turns "deploy this model" into start_model args (speed toggles, split hint, draft).
+// One place that turns "deploy this model" into start_model args (speed toggles, split hint, gpu-only).
 import { activeConversation, useCluster } from "../store/cluster";
 import { startModel, waitHealthy, probeRunningEngine, isTauri, abortGenerations } from "./api";
-import { draftFor, findModel, requiredMb } from "./models";
+import { findModel, requiredMb } from "./models";
 import type { EngineView, ModelEntry } from "./types";
 
 const LS_LAST = "argus.lastModel";
@@ -15,10 +15,10 @@ export async function deploy(m: ModelEntry, opts: { goChat?: boolean } = {}) {
   try {
     st.clearEngineLog();
     st.setRun({ status: "loading", model: m });
-    const draftHf = speed.speculative ? draftFor(m, speed.draft) : undefined;
     const endpoint = await startModel(m, {
       ctx, lan, needMb: requiredMb(m, ctx),
-      draftHf, draftMax: speed.draftMax,
+      // the draft model (on/off = snapshot.draftEnabled) is picked and downloaded by Rust
+      draftMax: speed.draftMax, gpuOnly: speed.gpuOnly,
       cacheReuse: speed.promptCache ? 256 : undefined,
       keepLoaded: speed.keepLoaded,
       // «Прогрев…»: the engine processes this chat's system prompt once right after load (prompt cache)

@@ -2,9 +2,9 @@ import { ChevronDown, ChevronUp, Copy, Cpu, ExternalLink, Loader2, MonitorSmartp
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useCluster } from "../store/cluster";
-import { CTX_PRESETS, DRAFT_CHOICES, MODELS, baseOf, bestPick, draftFor, draftInfo, findModel, fitLevel, modelPoolMb, phoneVariantOf, requiredMb } from "../lib/models";
-import { openExternal, planSplit, setDraftEnabled, setFastStart, setKeepLoaded, stopModel } from "../lib/api";
-import type { ModelEntry, SplitPlan } from "../lib/types";
+import { CTX_PRESETS, MODELS, baseOf, bestPick, findModel, fitLevel, modelPoolMb, phoneVariantOf, requiredMb } from "../lib/models";
+import { getDraftStatus, openExternal, planSplit, setDraftEnabled, setFastStart, setKeepLoaded, stopModel } from "../lib/api";
+import type { DraftStatus, ModelEntry, SplitPlan } from "../lib/types";
 import { NODE_COLORS } from "./MemoryPool";
 import { deploy } from "../lib/launch";
 import EngineBanner from "./EngineBanner";
@@ -162,18 +162,19 @@ export default function ModelLibrary() {
 
 /** 0.3.2: which devices would get layers for this model, which stay free, ≈ tok/s (plan_split). */
 function SplitPreview({ model, onVariant }: { model: ModelEntry; onVariant: (m: ModelEntry, toQ40: boolean) => void }) {
-  const { snapshot, ctx } = useCluster();
+  const { snapshot, ctx, speed } = useCluster();
   const need = requiredMb(model, ctx);
   const [plan, setPlan] = useState<SplitPlan | null>(null);
   const [err, setErr] = useState<string | null>(null);
   // re-plan only when something the planner reads changes (not on every load-meter tick)
   const sig = snapshot ? [...snapshot.gpus, ...snapshot.nodes].map((n) =>
-    `${n.id}:${n.stage}:${n.enabled}:${n.role}:${n.speed.toFixed(1)}:${Math.round(n.usableMb / 64)}`).join("|") + `|${snapshot.rolesEnabled}` : "";
+    `${n.id}:${n.stage}:${n.enabled}:${n.role}:${n.speed.toFixed(1)}:${Math.round(n.usableMb / 64)}`).join("|") + `|${snapshot.rolesEnabled}|${snapshot.draftEnabled}` : "";
+  // the same inputs start_model gets: the model (Rust reads its cached GGUF: real MoE experts), «Только видеокарта», draft
   useEffect(() => {
     let live = true;
-    planSplit(need).then((p) => { if (live) { setPlan(p); setErr(null); } }).catch((e) => live && setErr(String(e)));
+    planSplit(need, { model, gpuOnly: speed.gpuOnly }).then((p) => { if (live) { setPlan(p); setErr(null); } }).catch((e) => live && setErr(String(e)));
     return () => { live = false; };
-  }, [need, sig]);
+  }, [need, sig, model.id, model.hfRepo, model.hfFile, speed.gpuOnly]); // eslint-disable-line react-hooks/exhaustive-deps
   const name = (id: string) => [...(snapshot?.gpus ?? []), ...(snapshot?.nodes ?? [])].find((n) => n.id === id)?.name ?? id;
   const helpers = snapshot?.rolesEnabled ? snapshot.nodes.filter((n) => n.role === "helper" && n.stage === "connected") : [];
   const nodeOf = (id: string) => snapshot?.nodes.find((n) => n.id === id);
@@ -211,6 +212,14 @@ function SplitPreview({ model, onVariant }: { model: ModelEntry; onVariant: (m: 
             </div>
             {plan.gpuOnly && (
               <div className="flex items-center gap-1.5 text-2xs text-pl-green"><MonitorSmartphone size={11} /> Только видеокарта — кабель и телефоны не нужны, так быстрее всего.</div>
+            )}
+            {speed.gpuOnly && !plan.fits && (
+              <div className="text-2xs leading-4 text-pl-orange">Включено «Только видеокарта», а в видеокарту модель целиком не влезает. Выключите этот режим — тогда помогут телефоны и процессор ПК.</div>
+            )}
+            {plan.draft && (plan.draftMb ?? 0) > 0 && (
+              <div className="flex items-center gap-1.5 text-2xs text-pl-mute" title="Маленькая модель того же семейства угадывает слова, большая проверяет их пачкой">
+                <Zap size={11} className="text-pl-gold" /> Черновик в видеокарте: {gb(plan.draftMb ?? 0)} ГБ
+              </div>
             )}
             {cpuLayers > 0 && (
               <div className="flex items-center gap-1.5 text-2xs text-pl-mute" title="Эти слои считает процессор компьютера: в видеокарту и на устройства они уже не поместились">
@@ -254,32 +263,44 @@ function SplitPreview({ model, onVariant }: { model: ModelEntry; onVariant: (m: 
 function SpeedPanel() {
   const { speed, setSpeed, run, snapshot } = useCluster();
   const target = run.status === "ready" || run.status === "loading" || run.status === "broken" ? run.model : bestPick(modelPoolMb(snapshot));
-  const draft = target ? draftFor(target, speed.draft) : undefined;
-  const di = draft ? draftInfo(draft) : undefined;
   const pushToast = useCluster((s) => s.pushToast);
+  // one source of truth: Rust settings (snapshot.draftEnabled); `pending` only bridges the gap until the next snapshot
+  const [pending, setPending] = useState<boolean | null>(null);
+  const draftOn = pending ?? !!snapshot?.draftEnabled;
+  useEffect(() => { if (pending != null && snapshot?.draftEnabled === pending) setPending(null); }, [snapshot?.draftEnabled, pending]);
+  const [ds, setDs] = useState<DraftStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    getDraftStatus(target).then((d) => live && setDs(d)).catch(() => live && setDs(null));
+    return () => { live = false; };
+  }, [target?.id, target?.hfRepo, target?.hfFile, draftOn]); // eslint-disable-line react-hooks/exhaustive-deps
+  const toggleDraft = (v: boolean) => {
+    setPending(v);
+    setDraftEnabled(v).catch((e) => { setPending(null); pushToast("error", String(e)); });
+  };
+  const sizeGb = ds ? ds.sizeMb / 1024 : 0;
+  const draftSub = ds?.name
+    ? `черновик: ${ds.name} · ${sizeGb >= 1 ? sizeGb.toFixed(1) : sizeGb.toFixed(2)} ГБ${ds.present ? "" : " · скачается при запуске"} — угадывает слова, большая модель проверяет пачкой`
+    : ds?.note ? `${target ? `${target.name}: ` : ""}${ds.note}` : "маленькая модель того же семейства угадывает слова, большая проверяет пачкой";
   return (
     <div className="panel flex min-h-0 flex-col overflow-y-auto">
       <div className="panel-head"><span className="flex shrink-0 items-center gap-1.5"><Zap size={11} className="text-pl-gold" /> Ускорение</span><span className="min-w-0 truncate pl-2 normal-case tracking-normal text-pl-dim">при следующем Deploy</span></div>
       <div className="space-y-3 p-3 text-xs">
-        <Toggle on={speed.speculative} set={(v) => { setSpeed({ speculative: v }); setDraftEnabled(v).catch((e) => pushToast("error", String(e))); }} label="Ускорение черновиком"
-          sub={di ? `черновик: ${di.name} · ${di.sizeGb >= 1 ? di.sizeGb.toFixed(1) : di.sizeGb.toFixed(2)} ГБ — угадывает слова, большая модель проверяет пачкой` : "маленькая модель того же семейства угадывает слова, большая проверяет пачкой"} />
-        {speed.speculative && (
+        <Toggle on={draftOn} set={toggleDraft} label="Ускорение черновиком" sub={draftSub} />
+        {draftOn && (
           <div className="space-y-2 border-l-2 border-pl-line2 pl-2">
-            <select value={speed.draft} onChange={(e) => setSpeed({ draft: e.target.value })} className="h-7 w-full border border-pl-line2 bg-pl-bg3 px-1 text-2xs text-pl-text">
-              {DRAFT_CHOICES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-              <option value="none">Без черновой модели</option>
-            </select>
-            <div className="font-mono text-2xs text-pl-dim">{target ? (di ? `${target.name} ← ${di.name}${di.sizeGb ? ` (${di.sizeGb.toFixed(2)} ГБ)` : ""}` : `${target.name}: нет подходящего черновика`) : ""}</div>
+            <div className="text-2xs leading-4 text-pl-dim">Черновую модель Argus выбирает сам — того же семейства, что и основная, иначе они не поймут друг друга. Если подходящей нет, модель запустится без черновика.</div>
             <label className="flex items-center justify-between font-mono text-2xs text-pl-mute">--spec-draft-n-max
               <input type="number" min={2} max={64} value={speed.draftMax} onChange={(e) => setSpeed({ draftMax: Math.max(2, Math.min(64, Number(e.target.value) || 16)) })}
                 className="h-6 w-14 border border-pl-line2 bg-pl-bg0 px-1 text-right text-pl-text" />
             </label>
           </div>
         )}
+        <Toggle on={speed.gpuOnly} set={(v) => setSpeed({ gpuOnly: v })} label="Только видеокарта" sub="без телефонов и процессора ПК: быстрее всего, если модель целиком помещается в видеокарту" />
         <Toggle on={speed.promptCache} set={(v) => setSpeed({ promptCache: v })} label="Кэш промпта" sub="--cache-reuse 256: длинная переписка не пересчитывается заново" />
         <Toggle on={speed.keepLoaded} set={(v) => { setSpeed({ keepLoaded: v }); setKeepLoaded(v); }} label="Держать модель загруженной" sub="между чатами и перезапусками Argus; повторный Deploy той же модели мгновенный" />
         <Toggle on={speed.fastStart} set={(v) => { setSpeed({ fastStart: v }); setFastStart(v); }} label="Быстрый старт нод" sub="не перезапускать rpc-server на устройстве, если он уже работает с той же версией" />
-        <p className="border-t border-pl-line pt-2 text-2xs leading-4 text-pl-dim">Спекуляция помогает, когда основная модель большая и частично на телефонах: черновик (0.6–2B) считается локально, а дорогой проход по кабелю проверяет сразу пачку токенов.</p>
+        <p className="border-t border-pl-line pt-2 text-2xs leading-4 text-pl-dim">Черновик помогает, когда основная модель большая и частично на телефонах: маленькая модель (0.6–2B) считается в видеокарте, а дорогой проход по кабелю проверяет сразу пачку слов.</p>
       </div>
     </div>
   );
