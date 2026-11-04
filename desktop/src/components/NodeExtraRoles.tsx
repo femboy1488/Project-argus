@@ -14,7 +14,7 @@ const STATE_RU: Record<string, string> = {
 
 function stateText(r: NodeRoleReport | undefined, svc: NodeService | undefined): string | null {
   if (svc?.state === "ready") {
-    const where = svc.transport === "wifi" ? svc.base.replace(/^https?:\/\//, "") : `ПК :${svc.pc_port}`;
+    const where = svc.transport !== "usb" ? `${svc.base.replace(/^https?:\/\//, "")}${svc.transport === "tether" ? " · USB-модем" : ""}` : `ПК :${svc.pc_port}`;
     return `${STATE_RU.ready} · ${where}`;
   }
   if (svc?.state === "unreachable") return `${STATE_RU.unreachable} (${svc.base.replace(/^https?:\/\//, "")})`;

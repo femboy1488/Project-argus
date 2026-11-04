@@ -110,6 +110,9 @@ pub fn start_beacon_listener(app: AppHandle, st: Arc<AppState>) {
                         };
                         let Some(mut d) = parse_beacon(&buf[..n], src.ip()) else { continue };
                         d.src_port = src.port();
+                        // «USB-модем» puts a cabled phone into the app's network mode, so it beacons: that is the
+                        // USB node itself — no second (LAN) node and no LAN reply (its helper:false would stop USB roles)
+                        if crate::tether::owned_ip(&st, &d.host).await { continue; }
                         if reply_due(&d.host) {
                             let helper = crate::helper::lan_assignment(&st, &d.id()).await;
                             let msg = host_reply(crate::updater::NODE_UPDATE_PORT, crate::cluster::bundled_code(&st.bundled_node_version), false, Some(helper));

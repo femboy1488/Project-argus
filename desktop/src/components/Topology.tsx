@@ -31,7 +31,7 @@ export default function Topology({ selected, onSelect }: { selected: string; onS
               <animateMotion dur="1.8s" repeatCount="indefinite" path={`M${cx},${cy} L${pos[i].x},${pos[i].y}`} />
             </circle>}
             <text x={(cx + pos[i].x) / 2} y={(cy + pos[i].y) / 2 - 6} textAnchor="middle" className="fill-pl-dim font-mono" fontSize="9">
-              {n.transport === "lan" ? `LAN · ${n.endpoint}` : n.endpoint ?? n.stage.toUpperCase()}
+              {n.transport === "lan" ? `LAN · ${n.endpoint}` : n.link === "tether" && on ? `USB-модем · ${n.endpoint}` : n.endpoint ?? n.stage.toUpperCase()}
             </text>
           </g>
         );

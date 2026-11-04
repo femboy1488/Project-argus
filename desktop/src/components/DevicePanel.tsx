@@ -4,7 +4,7 @@ import clsx from "clsx";
 import { useCluster } from "../store/cluster";
 import {
   addDiscoveredNode, exportBenchResults, planSplit, rebenchNode, reconnectNode, rescan, removeLanNode, restartEngine, retryHelper, setAutoAdd, setHelperModel, setNodeEnabled,
-  setNodeRole, setNodeWeight, setRolesEnabled, updateUsbNode, wifiNodeUpdate,
+  setNodeRole, setNodeWeight, setRolesEnabled, setUsbTether, updateUsbNode, wifiNodeUpdate,
 } from "../lib/api";
 import { Toggle } from "./ChatView";
 import EngineBanner from "./EngineBanner";
@@ -31,7 +31,9 @@ export const stageTag: Record<NodeStage, [string, string]> = {
 
 export const TransportBadge = ({ n }: { n: ClusterNode }) =>
   n.transport === "lan" ? <span className="tag border border-pl-cyan/60 text-pl-cyan">{n.beacon ? "Wi-Fi" : "LAN"}</span>
-  : n.transport === "usb" ? <span className="tag border border-pl-line2 text-pl-mute">USB</span>
+  : n.transport === "usb" && n.link === "tether" && n.stage === "connected"
+    ? <span className="tag whitespace-nowrap border border-pl-green/60 text-pl-green" title="Связь через USB-модем телефона (сеть по кабелю), без adb-проброса">USB-модем</span>
+  : n.transport === "usb" ? <span className="tag border border-pl-line2 text-pl-mute" title={n.tether && n.tetherHint ? n.tetherHint : undefined}>USB</span>
   : <span className="tag border border-pl-line2 text-pl-mute">{n.integrated ? "iGPU" : n.kind === "gpu" ? "GPU" : "local"}</span>;
 
 // ---- 0.3.2 roles / speed
@@ -261,7 +263,7 @@ function Inspector({ node, snap }: { node: ClusterNode; snap: ClusterSnapshot })
   const rows: [string, string][] = [
     ["Object ID", node.id], ["Class", node.transport === "local" ? (node.kind === "gpu" ? "Local GPU" : "Host") : "RPC Node"],
     ["Device type", node.integrated ? "integrated gpu" : node.kind],
-    ["Transport", node.transport === "local" ? `local${node.device ? ` (${node.device})` : ""}` : node.transport === "lan" ? "LAN · TCP" : "USB · adb forward"],
+    ["Transport", node.transport === "local" ? `local${node.device ? ` (${node.device})` : ""}` : node.transport === "lan" ? "LAN · TCP" : node.link === "tether" ? "USB-модем · TCP" : "USB · adb forward"],
     ["Endpoint", node.endpoint ?? "—"], ["Version", node.version ?? (node.transport === "usb" ? "—" : "b12008")],
     ["Total memory", `${gb(node.totalMb, 2)} GB`], ["Free now", `${gb(node.availableMb, 2)} GB`],
     ["Allocatable", `${gb(node.usableMb, 2)} GB`], ["Load", `${node.loadPct.toFixed(1)} %`],
@@ -308,6 +310,7 @@ function Inspector({ node, snap }: { node: ClusterNode; snap: ClusterSnapshot })
             <div className="mt-1 flex justify-between gap-1 font-mono text-2xs text-pl-dim"><span>медленнее</span><span className="truncate">1.0 = как измерено</span><span>быстрее</span></div>
             <p className="mt-2 text-2xs leading-4 text-pl-dim">Скорость = результат теста (или оценка) × поправка. Самые быстрые устройства получают слои первыми, но не больше своей памяти. Применяется при следующем Deploy.</p>
           </div>
+          {node.transport === "usb" && <UsbTetherSwitch node={node} />}
           {node.transport === "usb" && <RebenchButton node={node} />}
           {node.updateAvailable && <NodeUpdateButton node={node} />}
           {node.transport !== "local" && <ReconnectButton node={node} />}
@@ -323,7 +326,9 @@ function Inspector({ node, snap }: { node: ClusterNode; snap: ClusterSnapshot })
           ? "llama-server runs here and drives every RPC node."
           : node.transport === "lan"
             ? "rpc-server в сети: без пароля и шифрования — только закрытая домашняя сеть."
-            : "rpc-server слушает loopback :50052 устройства и доступен только через USB-проброс. Отключили кабель — нода OFFLINE; вернули — подготовка повторится сама на том же порту."}
+            : node.link === "tether"
+              ? "Связь идёт через USB-модем телефона: компьютер подключается к его адресу в сети по кабелю. Пропал USB-модем — Argus сам вернётся на обычный USB-проброс."
+              : "rpc-server слушает loopback :50052 устройства и доступен только через USB-проброс. Отключили кабель — нода OFFLINE; вернули — подготовка повторится сама на том же порту."}
       </div>
     </aside>
   );
@@ -387,6 +392,28 @@ function RetryHelper({ id, onDone }: { id: string; onDone?: () => void }) {
     <button className="btn h-6" onClick={async () => { try { await retryHelper(id); onDone?.(); pushToast("info", "Пробую запустить Помощника снова…"); } catch (e) { pushToast("error", String(e)); } }}>
       <RotateCw size={11} /> Повторить
     </button>
+  );
+}
+
+/** «USB-модем»: reach the phone over Android USB tethering instead of the adb forward (tether.rs). */
+function UsbTetherSwitch({ node }: { node: ClusterNode }) {
+  const pushToast = useCluster((s) => s.pushToast);
+  const on = !!node.tether;
+  const active = node.link === "tether" && node.stage === "connected";
+  return (
+    <div className="space-y-1.5">
+      <Toggle on={on} set={(v) => setUsbTether(node.id, v).catch((e) => pushToast("error", String(e)))}
+        label="USB-модем" sub="связь с телефоном через его USB-модем вместо adb-проброса" />
+      {on && node.stage === "connected" && (active
+        ? <p className="text-2xs leading-4 text-pl-green">Работает через USB-модем · {node.endpoint}</p>
+        : node.tetherHint && <p className="text-2xs leading-4 text-pl-orange">{node.tetherHint}</p>)}
+      {on && (
+        <p className="text-2xs leading-4 text-pl-dim">
+          Если USB-модем на телефоне выключен, Argus работает по обычному USB. Для этого режима приложение на телефоне слушает все сети,
+          поэтому, пока он включён, телефон виден и в домашнем Wi-Fi — как в «Wi-Fi режиме».
+        </p>
+      )}
+    </div>
   );
 }
 

@@ -90,6 +90,12 @@ pub struct Node {
     pub temp_c: Option<f32>,
     /// the node reports thermal throttling
     pub throttled: Option<bool>,
+    /// how the PC reaches it right now: "local" | "usb" (adb forward) | "tether" (USB-модем) | "wifi"
+    pub link: String,
+    /// «USB-модем» option is on for this device (USB nodes)
+    pub tether: bool,
+    /// why «USB-модем» is not used right now (short Russian hint for the UI)
+    pub tether_hint: Option<String>,
 }
 
 impl Node {
@@ -100,14 +106,14 @@ impl Node {
                rpc_devices: 1, integrated: false, attempts: 0, retry_in: None, variant: None, beacon: false,
                in_engine: false, app_vc: None, app_version: None, update_available: None, update_skipped: false,
                bench_gbps: None, rtt_ms: None, speed: 0.0, speed_measured: false, role: "auto".into(), assigned: String::new(), helper: None,
-               temp_c: None, throttled: None }
+               temp_c: None, throttled: None, link: "usb".into(), tether: false, tether_hint: None }
     }
     pub fn lan(id: &str, name: &str, endpoint: &str) -> Self {
         Self { kind: NodeKind::Lan, stage: NodeStage::Offline, transport: Transport::Lan,
-               endpoint: Some(endpoint.into()), ..Self::device(id, name) }
+               endpoint: Some(endpoint.into()), link: "wifi".into(), ..Self::device(id, name) }
     }
     pub fn local(id: &str, name: &str, kind: NodeKind) -> Self {
-        Self { kind, stage: NodeStage::Connected, transport: Transport::Local, ..Self::device(id, name) }
+        Self { kind, stage: NodeStage::Connected, transport: Transport::Local, link: "local".into(), ..Self::device(id, name) }
     }
     pub fn online(&self) -> bool { self.stage == NodeStage::Connected }
 }
@@ -134,6 +140,12 @@ pub struct DeviceRuntime {
     pub approve_update: bool,
     /// refresh_metrics calls since the last `argus-status` dumpsys read
     pub status_tick: u32,
+    /// «USB-модем»: `<usb_net_ip>:50052` while the node is reached over USB tethering
+    pub tether_ep: Option<String>,
+    /// failed reachability checks in a row of the tether endpoint in use
+    pub tether_fails: u32,
+    /// the phone's own IPv4 addresses (wlan, rndis/ncm…): its Wi-Fi beacon is this USB node, not a new one
+    pub own_ips: Vec<String>,
 }
 
 pub use crate::beacon::Discovered;
@@ -443,6 +455,11 @@ impl AppState {
             n.speed_measured = n.bench_gbps.is_some();
             n.speed = split::node_speed(n);
             if n.transport != Transport::Local { n.role = settings.roles.get(&n.id).cloned().unwrap_or_else(|| "auto".into()); }
+            if n.transport == Transport::Usb {
+                n.tether = settings.usb_tether.contains(&n.id);
+                if !n.tether && n.link != "tether" { n.tether_hint = None; }
+                if !n.online() { n.link = "usb".into(); }
+            }
         };
         let mut gpus = self.gpus.lock().await.clone();
         gpus.iter_mut().for_each(apply);

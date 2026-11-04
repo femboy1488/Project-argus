@@ -1,4 +1,5 @@
-//! Extra services on USB phones (embeddings, whisper, kiwix), reached through `adb forward`.
+//! Extra services on USB phones (embeddings, whisper, kiwix), reached through `adb forward`
+//! (or the phone's USB-tethering IP when «USB-модем» is on, tether.rs).
 //!
 //! Port block per USB device: PC port = phone port + 100 + 10*slot. Slot 0 keeps the helper at 50162
 //! (50062 + 100); a second phone gets 50172 for its helper, 50170/50171/50173 for its services, and so on.
@@ -35,7 +36,7 @@ pub struct NodeService {
     pub state: String,
     /// base URL the PC uses for this service (USB: http://127.0.0.1:<pc_port>, Wi-Fi: http://<phone ip>:<port>)
     pub base: String,
-    /// "usb" | "wifi"
+    /// "usb" (adb forward) | "tether" (USB-модем: phone IP on the USB network) | "wifi"
     pub transport: String,
 }
 
@@ -59,7 +60,7 @@ pub fn pc_port(serial: &str, phone_port: u16) -> u16 { phone_port + 100 + 10 * s
 pub fn bases(service: &str) -> Vec<String> {
     let m = services().lock().unwrap_or_else(|e| e.into_inner());
     let mut v: Vec<&NodeService> = m.values().filter(|s| s.service == service).collect();
-    v.sort_by_key(|s| (s.state != "ready", s.transport != "usb", s.pc_port, s.device.clone()));
+    v.sort_by_key(|s| (s.state != "ready", s.transport == "wifi", s.pc_port, s.device.clone()));
     v.into_iter().map(|s| s.base.clone()).collect()
 }
 
@@ -67,7 +68,7 @@ pub fn bases(service: &str) -> Vec<String> {
 pub fn ready_bases(service: &str) -> Vec<String> {
     let m = services().lock().unwrap_or_else(|e| e.into_inner());
     let mut v: Vec<&NodeService> = m.values().filter(|s| s.service == service && s.state == "ready").collect();
-    v.sort_by_key(|s| (s.transport != "usb", s.pc_port, s.device.clone()));
+    v.sort_by_key(|s| (s.transport == "wifi", s.pc_port, s.device.clone()));
     v.into_iter().map(|s| s.base.clone()).collect()
 }
 
@@ -166,12 +167,23 @@ async fn tick(st: &Arc<AppState>) {
     for serial in usb {
         let out = st.adb.shell(&serial, &format!("dumpsys activity service {NODE_PKG}/.RpcService")).await.unwrap_or_default();
         let roles = parse_status(&out);
+        // «USB-модем»: the node app is in its network mode (whisper on 0.0.0.0, kiwix on all IPv4) → phone IP directly
+        let tether = crate::tether::service_host(st, &serial).await;
         for &(role, name, def_port) in SERVICES {
             let key = (serial.clone(), name.to_string());
             let local = pc_port(&serial, def_port);
             match roles.get(role) {
                 Some((state, port)) if !inactive(state) => {
                     let remote = port.unwrap_or(def_port);
+                    if let Some(host) = &tether {
+                        let base = format!("http://{host}:{remote}");
+                        if http_alive(&base).await {
+                            services().lock().unwrap_or_else(|e| e.into_inner()).insert(key, NodeService {
+                                device: serial.clone(), service: name.into(), pc_port: remote, state: "ready".into(), base, transport: "tether".into(),
+                            });
+                            continue;
+                        } // not answering over the USB network yet: the adb forward below
+                    }
                     let mut state = state.clone();
                     if !fw.iter().any(|(s, l, r)| s == &serial && *l == local && *r == remote) {
                         if let Err(e) = st.adb.forward(&serial, local, remote).await {

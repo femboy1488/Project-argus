@@ -250,6 +250,9 @@ export const setNodeWeight = (id: string, weight: number) =>
   isTauri ? tauriInvoke<void>("set_node_weight", { id, weight }) : (mock.weights[id] = weight, Promise.resolve());
 export const setNodeEnabled = (id: string, enabled: boolean) =>
   isTauri ? tauriInvoke<void>("set_node_enabled", { id, enabled }) : (mock.disabled[id] = !enabled, Promise.resolve());
+/** «USB-модем» for a USB phone (tether.rs); applied within a few seconds. */
+export const setUsbTether = (id: string, enabled: boolean) =>
+  isTauri ? tauriInvoke<void>("set_usb_tether", { id, enabled }) : (mock.tether[id] = enabled, Promise.resolve());
 export const setKeepLoaded = (enabled: boolean) =>
   isTauri ? tauriInvoke<void>("set_keep_loaded", { enabled }) : Promise.resolve();
 export const setFastStart = (enabled: boolean) =>
@@ -464,6 +467,8 @@ const mock = {
   lan: [] as ClusterNode[],
   weights: {} as Record<string, number>,
   disabled: {} as Record<string, boolean>,
+  /** «USB-модем» per device (Note10+ demo: on, tethering not enabled on the phone) */
+  tether: { R52T1234: true, R58N9ABC: false } as Record<string, boolean>,
   // 0.3.2
   roles: { R58N9ABC: "helper" } as Record<string, NodeRole>,
   bench: { R52T1234: 18.2, R58N9ABC: 9.1 } as Record<string, number>,
@@ -614,6 +619,14 @@ function mockNodes() {
   const lan = mock.lan.map((n) => mockSpeed({ ...n, weight: w(n.id, 1), enabled: en(n.id), loadPct: 5 + j() / 3, rttMs: 6.5 }, 4));
   const nodes = [tab, note, a52, ...lan];
   for (const n of nodes) { n.tempC = MOCK_TEMP[n.id] ?? null; n.throttled = (n.tempC ?? 0) >= 43; }
+  for (const n of nodes) {
+    if (n.transport === "lan") { n.link = "wifi"; continue; }
+    n.tether = !!mock.tether[n.id];
+    // demo: Galaxy S20 has USB tethering on, the others don't
+    n.link = n.tether && n.id === "R52T1234" ? "tether" : "usb";
+    if (n.link === "tether") n.endpoint = "192.168.42.129:50052";
+    n.tetherHint = n.tether && n.link !== "tether" ? "Включи на телефоне: Настройки → Подключения → Мобильная точка доступа → USB-модем" : null;
+  }
   for (const n of nodes) n.helper = mock.rolesEnabled && n.role === "helper" && n.stage === "connected" ? mockHelperView(n) : null;
   return { gpus, nodes, j };
 }
@@ -667,7 +680,7 @@ function mockTool(name: string, args: Record<string, unknown>): Promise<ToolOutp
 export const transcribe = (wavB64: string, base?: string) =>
   isTauri ? tauriInvoke<string>("transcribe", { wavB64, base: base || null }) : Promise.resolve("(демо) распознанный текст");
 /** pc_port: USB = forwarded PC port, Wi-Fi = port on the phone; base = URL the PC uses; state also "unreachable" (Wi-Fi) */
-export interface NodeService { device: string; service: string; pc_port: number; state: string; base: string; transport: "usb" | "wifi" }
+export interface NodeService { device: string; service: string; pc_port: number; state: string; base: string; transport: "usb" | "tether" | "wifi" }
 export const nodesvcList = () => (isTauri ? tauriInvoke<NodeService[]>("nodesvc_list") : Promise.resolve([] as NodeService[]));
 // «Голос» / «Библиотека» on a node (roles_extra.rs, Argus Node 0.3.3+)
 export type VoiceModelId = "tiny" | "base" | "small";

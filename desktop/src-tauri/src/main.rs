@@ -23,6 +23,7 @@ mod voice;
 mod vision;
 mod nodesvc;
 mod roles_extra;
+mod tether;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -122,6 +123,7 @@ fn main() {
             features::route_target,
             voice::transcribe,
             nodesvc::nodesvc_list,
+            tether::set_usb_tether,
             roles_extra::node_roles_get,
             roles_extra::set_node_voice,
             roles_extra::set_node_library,

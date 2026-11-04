@@ -147,6 +147,7 @@ pub async fn start(app: AppHandle, st: Arc<AppState>) {
     { let s = st.clone(); spawn_loop("lan", Duration::from_secs(2), move || { let s = s.clone(); async move { lan::refresh(&s).await } }); }
     lan::start_beacon_listener(app.clone(), st.clone());
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("engine", Duration::from_secs(1), move || { let (a, s) = (a.clone(), s.clone()); async move { crate::llama::supervise(&a, &s).await } }); }
+    { let s = st.clone(); spawn_loop("tether", Duration::from_secs(4), move || { let s = s.clone(); async move { crate::tether::tick(&s).await } }); }
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("helper", Duration::from_secs(3), move || { let (a, s) = (a.clone(), s.clone()); async move { crate::helper::tick(&a, &s).await } }); }
     { let (a, s) = (app.clone(), st.clone()); spawn_loop("emit", Duration::from_secs(1), move || { let (a, s) = (a.clone(), s.clone()); async move { emit(&a, &s).await } }); }
 }
@@ -370,7 +371,10 @@ async fn provision(app: &AppHandle, st: &Arc<AppState>, d: &AdbDevice, gen: u64)
 
     // Fast start: rpc-server already serving on the device and free -> reuse it (no service restart).
     // A real HELLO is used (not just "socket stays open"): a wedged or busy rpc-server gets restarted.
-    let engine_attached = crate::llama::engine_uses_endpoint(st, &endpoint).await;
+    // «USB-модем»: a kept-loaded engine may hold this phone through its tether address instead of the forward
+    let tether_ep = st.runtime.lock().await.get(serial).and_then(|r| r.tether_ep.clone());
+    let tether_attached = match &tether_ep { Some(t) => crate::llama::engine_uses_endpoint(st, t).await, None => false };
+    let engine_attached = tether_attached || crate::llama::engine_uses_endpoint(st, &endpoint).await;
     let reuse = !force_restart && !fresh_install && (fast_start || engine_attached) && if engine_attached {
         probe_rpc(local).await // the kept-loaded engine holds the single rpc-server slot
     } else {
@@ -421,7 +425,9 @@ async fn provision(app: &AppHandle, st: &Arc<AppState>, d: &AdbDevice, gen: u64)
     n.total_mb = total_kb / 1024;
     n.available_mb = avail_kb / 1024;
     n.usable_mb = usable_device_mb(n.available_mb);
-    n.endpoint = Some(endpoint);
+    // the running model keeps the address it uses (tether.rs moves it later when that is safe)
+    n.link = if tether_attached { "tether" } else { "usb" }.into();
+    n.endpoint = Some(if tether_attached { tether_ep.unwrap_or(endpoint) } else { endpoint });
     n.stage = NodeStage::Connected;
     n.error = None;
     if rtt.is_some() { n.rtt_ms = rtt; }

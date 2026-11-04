@@ -60,6 +60,11 @@ pub struct Settings {
     pub draft_enabled: bool,
     /// local draft .gguf chosen by hand (None = the family draft in <models>/draft/, downloaded on demand)
     pub draft_path: Option<String>,
+    /// «USB-модем»: USB serials whose rpc-server / roles are reached over Android USB tethering (tether.rs)
+    pub usb_tether: HashSet<String>,
+    /// serials Argus itself switched into the node app's network mode (`--ez wifi true`) for «USB-модем»;
+    /// switched back (`--ez wifi false`) when the user turns the option off
+    pub usb_tether_switched: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,7 +83,7 @@ impl Default for Settings {
                auto_add_discovered: false, keep_loaded: true, last_launch: None,
                check_updates: true, skipped_version: None, skipped_node_version: None,
                roles: HashMap::new(), bench: HashMap::new(), roles_enabled: false, helper_model: String::new(),
-               draft_enabled: false, draft_path: None }
+               draft_enabled: false, draft_path: None, usb_tether: HashSet::new(), usb_tether_switched: HashSet::new() }
     }
 }
 

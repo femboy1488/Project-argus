@@ -42,7 +42,14 @@ export interface ClusterNode {
   // ---- 0.3.3 (eng-core): device temperature
   tempC?: number | null;     // °C (battery/SoC for phones), null = unknown
   throttled?: boolean;       // the device slows down from heat («греется»)
+  // ---- «USB-модем» (tether.rs)
+  link?: NodeLink;           // how the PC reaches it right now
+  tether?: boolean;          // «USB-модем» option is on (USB nodes)
+  tetherHint?: string | null; // why USB-модем isn't used right now
 }
+
+/** usb = adb forward, tether = Android USB tethering («USB-модем»), wifi = network */
+export type NodeLink = "local" | "usb" | "tether" | "wifi";
 
 export type NodeRole = "auto" | "model" | "free" | "helper";
 export type NodeAssigned = "model" | "free" | "helper" | "off" | "";
