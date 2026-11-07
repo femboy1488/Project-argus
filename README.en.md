@@ -30,7 +30,7 @@ No root needed. The phone gets a regular app, Argus Node, which runs llama.cpp's
 Argus benchmarks each device on connect (speed and free memory) and hands out layers so tokens come out as fast as possible. If the model fits in VRAM alone, phones aren't used at all, because that's fastest.
 
 - PC side: Tauri 2 app (Rust + React/TS) running `llama-server` (llama.cpp b12008, Vulkan or CUDA) with `--rpc` pointing at the nodes.
-- Phone side: native APK with a static musl `rpc-server`. USB goes through `adb forward` or, since 0.3.4, through USB tethering. Wi-Fi nodes announce themselves via UDP beacon on port 50053.
+- Phone side: native APK with a static musl `rpc-server`. USB goes through `adb forward` or, since 0.3.4, through USB tethering. On my setup (GTX 960 + phones, Gemma 2 2B) tethering took generation from 16 to 36 tokens/s compared to `adb forward`. Wi-Fi nodes announce themselves via UDP beacon on port 50053.
 - Linux PCs and Raspberry Pi can be nodes too: `bash scripts/argus-node-linux.sh`.
 
 ## Features
